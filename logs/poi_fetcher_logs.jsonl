@@ -13,3 +13,14 @@
 {"task_name": "county_all", "run_time": "2026-04-13T19:08:19", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
 {"task_name": "city_all", "run_time": "2026-04-13T19:11:22", "area": "河北 /  / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
 {"task_name": "county_all", "run_time": "2026-04-13T19:11:22", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "云南丽江", "run_time": "2026-04-13T20:01:42", "area": "云南省 / 丽江市 / ", "status": "success", "records": 56, "mode": "manual", "message": "POI_Data\\2026-04-13\\云南丽江_20260413_200143.csv"}
+{"task_name": "云南丽江", "run_time": "2026-04-13T20:02:53", "area": "云南省 / 丽江市 / ", "status": "success", "records": 56, "mode": "manual", "message": "POI_Data\\2026-04-13\\云南丽江_20260413_200255.csv"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:04:01", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 48, "mode": "manual", "message": "POI_Data\\2026-04-13\\辛集_20260413_200403.csv"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:08:32", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:08:56", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:09:26", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:09:40", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:10:15", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 48, "mode": "manual", "message": "POI_Data\\2026-04-13\\辛集_20260413_201017.csv"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:10:50", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:11:17", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 61, "mode": "manual", "message": "POI_Data\\2026-04-13\\辛集_20260413_201119.csv"}
+{"task_name": "辛集", "run_time": "2026-04-13T20:20:47", "area": "河北省 / 石家庄市 / 辛集市", "status": "success", "records": 266, "mode": "manual", "message": "POI_Data\\2026-04-13\\辛集_20260413_202053.csv"}

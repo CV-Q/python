@@ -9,6 +9,7 @@ import queue
 import time
 import threading
 import requests
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from math import radians, cos, sin, asin, sqrt
@@ -418,7 +419,23 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual")
     target = task_target_values(task)
     keywords = []
     for resource in config.get("resources", []):
-        keywords.extend(merge_keywords(config, resource))
+        # If resource refers to a known resource key (like 'gas_station') or is present in
+        # config['keywords'], use merge_keywords to expand to provider-specific keywords.
+        try:
+            if isinstance(resource, str) and (resource in config.get("keywords", {}) or resource in RESOURCE_TYPES):
+                keywords.extend(merge_keywords(config, resource))
+            else:
+                # treat value as literal keyword(s), allow comma or Chinese comma separation
+                parts = [p.strip() for p in re.split(r"[,，]", str(resource)) if p.strip()]
+                keywords.extend(parts)
+        except Exception:
+            # fallback: treat as raw text
+            try:
+                parts = [p.strip() for p in re.split(r"[,，]", str(resource)) if p.strip()]
+                keywords.extend(parts)
+            except Exception:
+                continue
+    # deduplicate while preserving order
     keywords = list(dict.fromkeys(keywords))
     records: List[Dict[str, Any]] = []
     for keyword in keywords:

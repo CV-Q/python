@@ -21,14 +21,14 @@
   },
   "tasks": [
     {
-      "name": "云南加油站",
+      "name": "辛集",
       "enabled": true,
       "area_type": "admin",
       "admin_region": {
         "country": "中华人民共和国",
-        "province": "云南省",
-        "city": "",
-        "county": ""
+        "province": "河北省",
+        "city": "石家庄市",
+        "county": "辛集市"
       },
       "bbox": null
     }
@@ -42,7 +42,10 @@
   "logs_path": "logs/poi_fetcher_logs.jsonl",
   "provider": "baidu",
   "resources": [
-    "gas_station"
+    "gas_station",
+    "service_area",
+    "hospital",
+    "repair_factory"
   ],
   "export_format": "csv",
   "export_formats": [
@@ -50,8 +53,10 @@
     "json",
     "excel"
   ],
-  "default_page_limit": 3,
+  "default_page_limit": 5,
   "incremental": true,
   "schedule_interval_days": 1,
-  "max_concurrency": 1
+  "max_concurrency": 1,
+  "province_expand_concurrency": 1,
+  "province_expand_delay_seconds": 1.0
 }

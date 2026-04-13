@@ -8,6 +8,7 @@ from typing import Any, Dict
 import queue
 import threading
 import json
+import re
 import concurrent.futures
 
 
@@ -25,6 +26,8 @@ def create_gui_pyqt(config_path: str) -> None:
         get_task_area_summary,
         run_task,
         run_tasks,
+        # load_logs is provided via poi_utils and exposed through map_poi_fetcher
+        load_logs,
     )
 
     app = QtWidgets.QApplication([])
@@ -73,7 +76,10 @@ def create_gui_pyqt(config_path: str) -> None:
     task_name_edit = QtWidgets.QLineEdit()
     form.addRow("任务名称：", task_name_edit)
     area_type_combo = QtWidgets.QComboBox()
-    area_type_combo.addItems(["admin", "bbox"])
+    # 显示为中文/友好文本，内部使用映射保存为 'admin' / 'bbox'
+    area_type_combo.addItems(["行政区", "BBox"])
+    type_display_to_value = {"行政区": "admin", "BBox": "bbox"}
+    type_value_to_display = {v: k for k, v in type_display_to_value.items()}
     form.addRow("选择模式：", area_type_combo)
     country_label = QtWidgets.QLabel("中华人民共和国")
     form.addRow("国家：", country_label)
@@ -96,6 +102,18 @@ def create_gui_pyqt(config_path: str) -> None:
     save_task_btn = QtWidgets.QPushButton("保存任务")
     form.addRow(save_task_btn)
 
+    def update_mode_ui():
+        cur = area_type_combo.currentText()
+        mode_val = type_display_to_value.get(cur, cur)
+        is_admin = (mode_val == "admin")
+        province_combo.setEnabled(is_admin)
+        city_combo.setEnabled(is_admin)
+        county_combo.setEnabled(is_admin)
+        bbox_left.setEnabled(not is_admin)
+        bbox_bottom.setEnabled(not is_admin)
+        bbox_right.setEnabled(not is_admin)
+        bbox_top.setEnabled(not is_admin)
+
     # Use a tab widget: Task 编辑页 和 全局设置页
     tabs = QtWidgets.QTabWidget()
     tab_task = QtWidgets.QWidget()
@@ -109,22 +127,37 @@ def create_gui_pyqt(config_path: str) -> None:
     glob_group = QtWidgets.QGroupBox("全局设置")
     glob_layout = QtWidgets.QFormLayout(glob_group)
     provider_combo = QtWidgets.QComboBox()
-    provider_combo.addItems(["baidu", "gaode", "tencent"])
-    resources_edit = QtWidgets.QLineEdit(','.join(["gas_station", "service_area", "hospital", "repair_factory"]))
+    # display Chinese names, map to internal provider keys
+    provider_display_to_value = {"百度": "baidu", "高德": "gaode", "腾讯": "tencent"}
+    provider_value_to_display = {v: k for k, v in provider_display_to_value.items()}
+    provider_combo.addItems(list(provider_display_to_value.keys()))
+    # resources: store as comma-separated keywords by default, but show a persistent JSON example below
+    example_resources = ["gas_station", "service_area", "hospital", "repair_factory"]
+    resources_edit = QtWidgets.QLineEdit(json.dumps(example_resources, ensure_ascii=False))
+    resources_edit.setToolTip("输入资源关键字，支持 JSON 列表或逗号分隔的关键字；示例已填入并可复制")
+    example_label = QtWidgets.QLabel(json.dumps(example_resources, ensure_ascii=False))
+    # allow users to select/copy the example text
+    try:
+        example_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+    except Exception:
+        pass
     export_combo = QtWidgets.QComboBox()
     export_combo.addItems(["csv", "json", "excel"])
     concurrency_spin = QtWidgets.QSpinBox(); concurrency_spin.setRange(1, 32)
     province_expand_concurrency_spin = QtWidgets.QSpinBox(); province_expand_concurrency_spin.setRange(1, 64)
     province_expand_delay_spin = QtWidgets.QDoubleSpinBox(); province_expand_delay_spin.setRange(0.0, 60.0); province_expand_delay_spin.setSingleStep(0.1)
     page_spin = QtWidgets.QSpinBox(); page_spin.setRange(1, 100)
+    check_interval_spin = QtWidgets.QSpinBox(); check_interval_spin.setRange(1, 1440)
     incr_check = QtWidgets.QCheckBox()
     sched_spin = QtWidgets.QSpinBox(); sched_spin.setRange(1, 365)
     glob_layout.addRow("提供商：", provider_combo)
     glob_layout.addRow("资源：", resources_edit)
+    glob_layout.addRow("资源示例(JSON)：", example_label)
     glob_layout.addRow("导出格式：", export_combo)
     glob_layout.addRow("并发数：", concurrency_spin)
     glob_layout.addRow("省展开并发数：", province_expand_concurrency_spin)
     glob_layout.addRow("省展开延迟(秒)：", province_expand_delay_spin)
+    glob_layout.addRow("调度检查间隔(分钟)：", check_interval_spin)
     glob_layout.addRow("分页限制：", page_spin)
     glob_layout.addRow("增量去重：", incr_check)
     glob_layout.addRow("调度间隔(天)：", sched_spin)
@@ -171,7 +204,23 @@ def create_gui_pyqt(config_path: str) -> None:
     def refresh_task_list() -> None:
         task_list.clear()
         for t in current_cfg.get("tasks", []):
-            task_list.addItem(f"{t.get('name')} | {get_task_area_summary(t)}")
+            text = f"{t.get('name')} | {get_task_area_summary(t)}"
+            item = QtWidgets.QListWidgetItem(text)
+            # make item checkbox-enabled for easy multi-selection
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            task_list.addItem(item)
+
+    def get_checked_task_indices() -> List[int]:
+        idxs: List[int] = []
+        for i in range(task_list.count()):
+            it = task_list.item(i)
+            try:
+                if it.checkState() == QtCore.Qt.Checked:
+                    idxs.append(i)
+            except Exception:
+                pass
+        return idxs
 
     def update_provinces():
         province_combo.clear(); province_combo.addItems(sorted(region_data.keys()))
@@ -208,7 +257,9 @@ def create_gui_pyqt(config_path: str) -> None:
         except Exception:
             return
         task_name_edit.setText(t.get("name", ""))
-        area_type_combo.setCurrentText(t.get("area_type", "admin"))
+        # map stored internal value ('admin'/'bbox') to display text
+        stored_atype = t.get("area_type", "admin")
+        area_type_combo.setCurrentText(type_value_to_display.get(stored_atype, stored_atype))
         province_combo.setCurrentText(t.get("admin_region", {}).get("province", ""))
         update_cities()
         # map empty-string (saved meaning '全部') to display value '全部'
@@ -221,6 +272,16 @@ def create_gui_pyqt(config_path: str) -> None:
         bbox_bottom.setText(str((t.get("bbox") or {}).get("bottom", "")))
         bbox_right.setText(str((t.get("bbox") or {}).get("right", "")))
         bbox_top.setText(str((t.get("bbox") or {}).get("top", "")))
+        # update enabled/disabled widgets based on loaded mode
+        try:
+            update_mode_ui()
+        except Exception:
+            pass
+        # display logs for this task (success/failure entries)
+        try:
+            display_task_logs(t.get("name", ""))
+        except Exception:
+            pass
 
     def on_task_selected():
         idx = task_list.currentRow()
@@ -231,12 +292,27 @@ def create_gui_pyqt(config_path: str) -> None:
         nonlocal executor
         # write global settings into current_cfg and save
         try:
-            current_cfg["provider"] = provider_combo.currentText()
-            current_cfg["resources"] = [r.strip() for r in resources_edit.text().split(",") if r.strip()]
+            # map displayed provider name back to internal key
+            cur_prov_display = provider_combo.currentText()
+            current_cfg["provider"] = provider_display_to_value.get(cur_prov_display, cur_prov_display)
+            # resources: accept JSON list or comma/Chinese-comma separated keywords
+            raw = resources_edit.text().strip()
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    current_cfg["resources"] = [str(x).strip() for x in parsed if str(x).strip()]
+                else:
+                    raise ValueError("not a list")
+            except Exception:
+                parts = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
+                current_cfg["resources"] = parts
             current_cfg["export_format"] = export_combo.currentText()
             current_cfg["province_expand_concurrency"] = int(province_expand_concurrency_spin.value())
             current_cfg["province_expand_delay_seconds"] = float(province_expand_delay_spin.value())
             current_cfg["default_page_limit"] = int(page_spin.value())
+            # scheduler settings are nested under 'scheduler'
+            sched = current_cfg.setdefault("scheduler", {})
+            sched["check_interval_minutes"] = int(check_interval_spin.value())
             current_cfg["incremental"] = bool(incr_check.isChecked())
             current_cfg["schedule_interval_days"] = int(sched_spin.value())
             current_cfg["max_concurrency"] = int(concurrency_spin.value())
@@ -266,7 +342,9 @@ def create_gui_pyqt(config_path: str) -> None:
             if not name:
                 append_log_msg("任务名称不能为空")
                 return
-            atype = area_type_combo.currentText()
+            # map display text to internal value
+            atype_display = area_type_combo.currentText()
+            atype = type_display_to_value.get(atype_display, atype_display)
             task: Dict[str, Any] = {"name": name, "enabled": True, "area_type": atype}
             if atype == "bbox":
                 task["bbox"] = {"left": float(bbox_left.text() or 0), "bottom": float(bbox_bottom.text() or 0), "right": float(bbox_right.text() or 0), "top": float(bbox_top.text() or 0)}
@@ -298,6 +376,21 @@ def create_gui_pyqt(config_path: str) -> None:
         task_name_edit.setText(f"新任务_{len(current_cfg.get('tasks', []))+1}")
 
     def delete_task_ui():
+        checked = get_checked_task_indices()
+        if checked:
+            # delete in reverse order to keep indices valid
+            try:
+                names = []
+                for idx in sorted(checked, reverse=True):
+                    names.append(current_cfg.get("tasks", [])[idx].get("name"))
+                    del current_cfg["tasks"][idx]
+                save_json(config_edit.text(), current_cfg)
+                refresh_task_list()
+                append_log_msg(f"已删除任务: {', '.join(names)}")
+            except Exception as e:
+                append_log_msg(f"删除任务失败: {e}")
+            return
+        # fallback to single selection deletion
         idx = task_list.currentRow()
         if idx < 0:
             return
@@ -317,7 +410,33 @@ def create_gui_pyqt(config_path: str) -> None:
         except Exception as e:
             logs_queue.put(f"任务运行失败: {e}")
 
+    def display_task_logs(task_name: str) -> None:
+        try:
+            logs.clear()
+            all_logs = load_logs(current_cfg.get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+            found = False
+            for entry in all_logs:
+                if entry.get("task_name") == task_name:
+                    logs.append(json.dumps(entry, ensure_ascii=False))
+                    found = True
+            if not found:
+                logs.append(f"未找到任务 '{task_name}' 的执行日志。")
+        except Exception as e:
+            logs.append(f"读取日志失败: {e}")
+
     def run_selected_ui():
+        checked = get_checked_task_indices()
+        if checked:
+            for idx in checked:
+                try:
+                    t = current_cfg.get("tasks", [])[idx]
+                except Exception:
+                    continue
+                try:
+                    executor.submit(worker_run_task, t)
+                except Exception:
+                    threading.Thread(target=worker_run_task, args=(t,), daemon=True).start()
+            return
         idx = task_list.currentRow()
         if idx < 0:
             logs_queue.put("请先选择任务。")
@@ -346,8 +465,10 @@ def create_gui_pyqt(config_path: str) -> None:
     task_list.currentRowChanged.connect(lambda _i: on_task_selected())
     province_combo.currentIndexChanged.connect(lambda _i: update_cities())
     city_combo.currentIndexChanged.connect(lambda _i: update_counties())
+    area_type_combo.currentIndexChanged.connect(lambda _i: update_mode_ui())
     btn_load.clicked.connect(lambda: (refresh_task_list(), update_provinces(), append_log_msg("已加载配置")))
     btn_save.clicked.connect(save_config_ui)
+    btn_save_global.clicked.connect(save_config_ui)
     save_task_btn.clicked.connect(save_task)
     btn_add.clicked.connect(add_task_ui)
     btn_delete.clicked.connect(delete_task_ui)
@@ -355,14 +476,26 @@ def create_gui_pyqt(config_path: str) -> None:
     btn_run_all.clicked.connect(run_all_ui)
 
     # initialize UI values
-    provider_combo.setCurrentText(current_cfg.get("provider", provider_combo.currentText()))
-    resources_edit.setText(','.join(current_cfg.get("resources", [])))
+    # set provider display text from stored internal key
+    provider_combo.setCurrentText(provider_value_to_display.get(current_cfg.get("provider", ""), provider_combo.currentText()))
+    # show resources as JSON for clarity and easy copy/paste
+    try:
+        resources_edit.setText(json.dumps(current_cfg.get("resources", []), ensure_ascii=False))
+    except Exception:
+        resources_edit.setText(','.join(current_cfg.get("resources", [])))
     export_combo.setCurrentText(str(current_cfg.get("export_format", export_combo.currentText())))
     page_spin.setValue(int(current_cfg.get("default_page_limit", page_spin.value())))
     province_expand_concurrency_spin.setValue(int(current_cfg.get("province_expand_concurrency", province_expand_concurrency_spin.value())))
     province_expand_delay_spin.setValue(float(current_cfg.get("province_expand_delay_seconds", province_expand_delay_spin.value())))
+    check_interval_spin.setValue(int(current_cfg.get("scheduler", {}).get("check_interval_minutes", check_interval_spin.value())))
     incr_check.setChecked(bool(current_cfg.get("incremental", incr_check.isChecked())))
     sched_spin.setValue(int(current_cfg.get("schedule_interval_days", sched_spin.value())))
+    # initialize area type display and UI mode
+    area_type_combo.setCurrentText(type_value_to_display.get(current_cfg.get("default_area_type", "admin"), type_value_to_display.get("admin")))
+    try:
+        update_mode_ui()
+    except Exception:
+        pass
     update_provinces(); update_cities(); update_counties(); refresh_task_list()
 
     win.show()
