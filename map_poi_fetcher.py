@@ -11,6 +11,19 @@ import requests
 
 SUPPORTED_PROVIDERS = ["baidu", "gaode", "tencent"]
 SUPPORTED_PLACES = ["hospital", "warehouse", "school", "supermarket", "car_repair", "gas_station"]
+CITY_COORDINATES = {
+    "石家庄": (38.0428, 114.5149),
+    "唐山": (39.6305, 118.1800),
+    "保定": (38.8739, 115.4643),
+    "邯郸": (36.6256, 114.5384),
+    "沧州": (38.3044, 116.8388),
+    "衡水": (37.7388, 115.6768),
+    "邢台": (37.0682, 114.5049),
+    "秦皇岛": (39.9354, 119.5996),
+    "张家口": (40.8244, 114.8876),
+    "承德": (40.9529, 117.9630),
+    "廊坊": (39.5209, 116.7037),
+}
 
 PLACE_KEYWORDS = {
     "hospital": "医院",
@@ -129,7 +142,6 @@ def fetch_gaode(key: str, place_type: str, latitude: Optional[float], longitude:
                 "key": key,
                 "polygon": polygon,
                 "keywords": PLACE_KEYWORDS[place_type],
-                "types": types,
                 "offset": 20,
                 "page": page,
                 "extensions": "base",
@@ -140,7 +152,6 @@ def fetch_gaode(key: str, place_type: str, latitude: Optional[float], longitude:
                 "key": key,
                 "location": f"{longitude},{latitude}",
                 "keywords": PLACE_KEYWORDS[place_type],
-                "types": types,
                 "radius": radius,
                 "offset": 20,
                 "page": page,
