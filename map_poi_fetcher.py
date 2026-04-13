@@ -40,11 +40,9 @@ try:
 except ImportError:
     openpyxl = None
 
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-except ImportError:
-    tk = None
+# tkinter usage has been removed to avoid requiring a Tkinter dependency.
+# See archive/gui_tk_backup.py for the original implementation if needed.
+tk = None
 
 try:
     from PyQt5 import QtWidgets, QtCore
@@ -127,7 +125,11 @@ DEFAULT_CONFIG = {
     "default_page_limit": 3,
     "incremental": True,
     "schedule_interval_days": 1,
-    "max_concurrency": 1,
+    "max_concurrency": 3,
+    # when expanding a province into per-city requests (UI '全部' at city level),
+    # control how many city-requests run concurrently and minimal delay between requests
+    "province_expand_concurrency": 1,
+    "province_expand_delay_seconds": 1,
 }
 
 X_PI = math.pi * 3000.0 / 180.0
@@ -421,6 +423,84 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual")
     records: List[Dict[str, Any]] = []
     for keyword in keywords:
         for provider in providers:
+            # If admin task and city is empty (UI '全部' selected at city level), expand to all cities in province
+            if task.get("area_type") == "admin":
+                admin = task.get("admin_region", {})
+                prov = admin.get("province", "")
+                cit = admin.get("city", None)
+                # treat None as not set; empty-string indicates UI '全部'
+                if cit == "":
+                    # try to load region cache from common location
+                    try:
+                        cache = load_region_cache("config/region_cache.json")
+                    except Exception:
+                        cache = {}
+                    cities_list = []
+                    if isinstance(cache, dict) and prov in cache:
+                        val = cache[prov]
+                        if isinstance(val, list):
+                            cities_list = [str(x) for x in val]
+                        elif isinstance(val, dict):
+                            cities_list = list(val.keys())
+                    if not cities_list and prov in REGION_DATA:
+                        cities_list = list(REGION_DATA.get(prov, []))
+                    # if still empty, fall back to a single empty city to preserve prior behavior
+                    if not cities_list:
+                        cities_list = [""]
+
+                    # Use a thread pool to fetch per-city, honoring configured concurrency and delay
+                    concurrency = int(config.get("province_expand_concurrency", config.get("max_concurrency", 1)))
+                    delay = float(config.get("province_expand_delay_seconds", 0.0))
+
+                    # global rate limiter state for spacing requests
+                    rate_lock = threading.Lock()
+                    last_call = {"t": 0.0}
+
+                    def call_fetch_for_city(city_name: str):
+                        # enforce minimal delay between requests (global)
+                        with rate_lock:
+                            now = time.time()
+                            wait = max(0.0, delay - (now - last_call["t"]))
+                            if wait > 0:
+                                time.sleep(wait)
+                            last_call["t"] = time.time()
+                        try:
+                            return fetch_provider_records(
+                                provider,
+                                config.get("api_keys", {}),
+                                keyword,
+                                task.get("resource_type", ""),
+                                None,
+                                None,
+                                None,
+                                {"province": prov, "city": city_name, "county": ""},
+                                page_limit,
+                            )
+                        except Exception as exc:
+                            append_log(config["logs_path"], {
+                                "task_name": task_name,
+                                "run_time": run_time,
+                                "area": f"{prov} / {city_name} / ",
+                                "status": "failed",
+                                "records": 0,
+                                "mode": mode,
+                                "message": f"子区域抓取失败: {exc}",
+                            })
+                            return []
+
+                    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+                        futures = {pool.submit(call_fetch_for_city, c): c for c in cities_list}
+                        for fut in as_completed(futures):
+                            city_item = futures[fut]
+                            try:
+                                provider_records = fut.result()
+                            except Exception as exc:
+                                provider_records = []
+                            for item in provider_records:
+                                records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                    # finished expanding cities for this provider+keyword
+                    continue
+            # default single-call behavior
             try:
                 provider_records = fetch_provider_records(
                     provider,
@@ -569,490 +649,9 @@ def show_logs(config: Dict[str, Any], status: Optional[str] = None) -> None:
 
 
 def create_gui(config_path: str) -> None:
-    if tk is None:
-        print("当前环境不支持 Tkinter，无法启动 GUI。")
-        return
-
-    root = tk.Tk()
-    root.title("POI 任务调度器")
-    root.geometry("1000x700")
-
-    main_frame = ttk.Frame(root, padding=10)
-    main_frame.pack(fill="both", expand=True)
-
-    config_var = tk.StringVar(value=config_path)
-    ttk.Label(main_frame, text="配置文件：").grid(row=0, column=0, sticky="w")
-    ttk.Entry(main_frame, textvariable=config_var, width=60).grid(row=0, column=1, sticky="w")
-    ttk.Button(main_frame, text="刷新配置", command=lambda: load_config_file()).grid(row=0, column=2, sticky="w")
-    ttk.Button(main_frame, text="保存配置", command=lambda: save_current_config()).grid(row=0, column=3, sticky="w")
-
-    content_frame = ttk.Frame(main_frame)
-    content_frame.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
-    main_frame.rowconfigure(1, weight=1)
-    main_frame.columnconfigure(1, weight=1)
-
-    task_frame = ttk.LabelFrame(content_frame, text="任务列表与管理", padding=10)
-    task_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-    task_frame.rowconfigure(1, weight=1)
-    task_frame.columnconfigure(0, weight=1)
-
-    editor_frame = ttk.LabelFrame(content_frame, text="任务详情编辑", padding=10)
-    editor_frame.grid(row=0, column=1, sticky="nsew")
-    content_frame.columnconfigure(1, weight=1)
-
-    task_list = tk.Listbox(task_frame, width=60, height=20)
-    task_list.grid(row=1, column=0, sticky="nsew")
-    task_scroll = ttk.Scrollbar(task_frame, orient="vertical", command=task_list.yview)
-    task_scroll.grid(row=1, column=1, sticky="ns")
-    task_list.config(yscrollcommand=task_scroll.set)
-
-    task_buttons = ttk.Frame(task_frame)
-    task_buttons.grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky="w")
-    ttk.Button(task_buttons, text="新增任务", command=lambda: add_task()).grid(row=0, column=0, padx=5)
-    ttk.Button(task_buttons, text="删除任务", command=lambda: delete_task()).grid(row=0, column=1, padx=5)
-    ttk.Button(task_buttons, text="运行选中任务", command=lambda: run_selected()).grid(row=0, column=2, padx=5)
-    ttk.Button(task_buttons, text="运行全部任务", command=lambda: run_all_tasks()).grid(row=0, column=3, padx=5)
-    ttk.Button(task_buttons, text="加载日志", command=lambda: load_log_entries()).grid(row=0, column=4, padx=5)
-
-    log_frame = ttk.LabelFrame(main_frame, text="日志输出", padding=10)
-    log_frame.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
-    main_frame.rowconfigure(2, weight=1)
-
-    log_text = tk.Text(log_frame, width=120, height=12, wrap="word")
-    log_text.pack(fill="both", expand=True)
-
-    def append_log(message: str) -> None:
-        log_text.insert("end", message + "\n")
-        log_text.see("end")
-
-    current_task_index = {"value": None}
-    current_config: Dict[str, Any] = {"value": load_config(config_path)}
-    region_data: Dict[str, Dict[str, List[str]]] = {"value": ensure_region_data(config_path, current_config["value"].get("api_keys", {}).get("gaode", ""))}
-
-    task_name_var = tk.StringVar()
-    task_enabled_var = tk.BooleanVar(value=True)
-    area_type_var = tk.StringVar(value="admin")
-    country_var = tk.StringVar(value="中国")
-    province_var = tk.StringVar()
-    city_var = tk.StringVar()
-    county_var = tk.StringVar()
-    # radius removed per user request (center+radius queries disabled)
-    bbox_left_var = tk.StringVar()
-    bbox_bottom_var = tk.StringVar()
-    bbox_right_var = tk.StringVar()
-    bbox_top_var = tk.StringVar()
-    # Global settings (now shared across all tasks)
-    providers_var = tk.StringVar(value=current_config["value"].get("provider", SUPPORTED_PROVIDERS[0]))
-    resources_var = tk.StringVar(value=",".join(current_config["value"].get("resources", [RESOURCE_TYPES[0]])))
-    page_limit_var = tk.StringVar(value=str(current_config["value"].get("default_page_limit", 3)))
-    incremental_var = tk.BooleanVar(value=bool(current_config["value"].get("incremental", True)))
-    schedule_interval_var = tk.StringVar(value=str(current_config["value"].get("schedule_interval_days", 1)))
-    # single export format (global)
-    export_format_var = tk.StringVar(value=str(current_config["value"].get("export_format", (current_config["value"].get("export_formats", ["csv"])[0]))))
-    # concurrency (thread pool size)
-    concurrency_var = tk.StringVar(value=str(current_config["value"].get("max_concurrency", 1)))
-
-    def get_country_choices() -> List[str]:
-        return ["中华人民共和国"]
-    def get_province_choices() -> List[str]:
-        return sorted(region_data["value"].keys())
-    def get_city_choices() -> List[str]:
-        province = province_var.get().strip()
-        return sorted(region_data["value"].get(province, {}).keys()) if province else []
-    def get_county_choices() -> List[str]:
-        province = province_var.get().strip()
-        city = city_var.get().strip()
-        return sorted(region_data["value"].get(province, {}).get(city, [])) if province and city else []
-    def update_province_options(*_args) -> None:
-        province_combobox["values"] = get_province_choices()
-        if province_var.get() not in province_combobox["values"]:
-            province_var.set("")
-        update_city_options()
-    def update_city_options(*_args) -> None:
-        city_combobox["values"] = get_city_choices()
-        if city_var.get() not in city_combobox["values"]:
-            city_var.set("")
-        update_county_options()
-    def update_county_options(*_args) -> None:
-        # 如果已有县列表则直接使用，否则尝试在线获取并缓存
-        province = province_var.get().strip()
-        city = city_var.get().strip()
-        county_list = get_county_choices()
-        if not county_list and province and city:
-            try:
-                gaode_key = current_config["value"].get("api_keys", {}).get("gaode", "")
-                fetched = fetch_amap_subdistrict(gaode_key, province, city)
-                if fetched:
-                    region_data["value"].setdefault(province, {})[city] = fetched
-                    try:
-                        save_region_cache(get_region_cache_path(config_var.get()), region_data["value"])
-                    except Exception:
-                        pass
-                    append_log(f"已在线获取并缓存区县：{province} / {city} -> {len(fetched)} 项")
-                    county_list = fetched
-            except Exception as exc:
-                append_log(f"获取区县失败：{exc}")
-
-        county_combobox["values"] = county_list
-        if county_var.get() not in county_combobox["values"]:
-            county_var.set("")
-    def refresh_region_data() -> None:
-        try:
-            region_data["value"] = ensure_region_data(config_var.get(), current_config["value"].get("api_keys", {}).get("gaode", ""))
-            append_log("已刷新省市区数据。")
-            province_combobox["values"] = get_province_choices()
-        except Exception as exc:
-            messagebox.showwarning("警告", f"刷新省市区数据失败：{exc}\n已使用本地缓存或默认数据。")
-
-    def load_config_file() -> None:
-        try:
-            current_config["value"] = load_config(config_var.get())
-            region_data["value"] = ensure_region_data(config_var.get(), current_config["value"].get("api_keys", {}).get("gaode", ""))
-            province_combobox["values"] = get_province_choices()
-            city_combobox["values"] = get_city_choices()
-            county_combobox["values"] = get_county_choices()
-            refresh_tasks()
-            # 更新 resources 帮助文本以反映当前配置
-            try:
-                cfg_keywords = current_config["value"].get("keywords", {})
-                resources_example = ", ".join(sorted(cfg_keywords.keys())) if cfg_keywords else ", ".join(RESOURCE_TYPES)
-                kw_examples = "; ".join([f"{k}: {', '.join((v or [])[:3])}" for k, v in cfg_keywords.items()]) if cfg_keywords else "; ".join([f"{k}: {', '.join(v[:3])}" for k, v in DEFAULT_KEYWORDS.items()])
-                resources_help_label.config(text=f"可用资源: {resources_example}；关键词示例: {kw_examples}")
-            except Exception:
-                pass
-            # 将全局设置同步到 UI
-            try:
-                providers_var.set(current_config["value"].get("provider", providers_var.get()))
-                resources_var.set(",".join(current_config["value"].get("resources", [])))
-                export_format_var.set(str(current_config["value"].get("export_format", export_format_var.get())))
-                page_limit_var.set(str(current_config["value"].get("default_page_limit", page_limit_var.get())))
-                incremental_var.set(bool(current_config["value"].get("incremental", incremental_var.get())))
-                schedule_interval_var.set(str(current_config["value"].get("schedule_interval_days", schedule_interval_var.get())))
-            except Exception:
-                pass
-            append_log(f"已加载配置：{config_var.get()}")
-        except Exception as exc:
-            messagebox.showerror("错误", f"加载配置失败：{exc}")
-
-    # create executor for Tkinter GUI
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(current_config["value"].get("max_concurrency", 1)))
-
-    def save_current_config() -> None:
-        nonlocal executor
-        try:
-            # 更新 global 设置到 current_config
-            try:
-                current_config["value"]["provider"] = providers_var.get().strip()
-                current_config["value"]["resources"] = [r.strip() for r in resources_var.get().split(",") if r.strip()]
-                current_config["value"]["export_format"] = export_format_var.get().strip()
-                current_config["value"]["max_concurrency"] = int(concurrency_var.get() or current_config["value"].get("max_concurrency", 1))
-                # keep legacy export_formats list untouched
-                current_config["value"]["default_page_limit"] = int(page_limit_var.get() or current_config["value"].get("default_page_limit", 3))
-                current_config["value"]["incremental"] = bool(incremental_var.get())
-                current_config["value"]["schedule_interval_days"] = int(schedule_interval_var.get() or current_config["value"].get("schedule_interval_days", 1))
-            except Exception:
-                pass
-            save_json(config_var.get(), current_config["value"])
-            # recreate executor if concurrency changed
-            try:
-                new_max = int(current_config["value"].get("max_concurrency", 1))
-                # if changed, shutdown and recreate
-                if getattr(executor, "_max_workers", None) != new_max:
-                    try:
-                        executor.shutdown(wait=False)
-                    except Exception:
-                        pass
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=new_max)
-            except Exception:
-                pass
-            append_log(f"已保存配置：{config_var.get()}")
-        except Exception as exc:
-            messagebox.showerror("错误", f"保存配置失败：{exc}")
-
-    def format_task_list_item(task: Dict[str, Any]) -> str:
-        # resources display from global configuration
-        global_resources = current_config["value"].get("resources", [])
-        return f"{task.get('name')} | {get_task_area_summary(task)} | resources={global_resources} | enabled={task.get('enabled', True)}"
-
-    def refresh_tasks() -> None:
-        task_list.delete(0, "end")
-        for task in current_config["value"].get("tasks", []):
-            task_list.insert("end", format_task_list_item(task))
-        clear_task_form()
-        current_task_index["value"] = None
-
-    def load_task_to_form(index: int) -> None:
-        task = current_config["value"].get("tasks", [])[index]
-        current_task_index["value"] = index
-        task_name_var.set(task.get("name", ""))
-        task_enabled_var.set(task.get("enabled", True))
-        area_type_var.set(task.get("area_type", "admin"))
-        country_var.set(task.get("admin_region", {}).get("country", "中华人民共和国"))
-        province_var.set(task.get("admin_region", {}).get("province", ""))
-        update_province_options()
-        city_var.set(task.get("admin_region", {}).get("city", ""))
-        update_city_options()
-        county_var.set(task.get("admin_region", {}).get("county", ""))
-        update_county_options()
-        # radius removed; nothing to set
-        bbox = task.get("bbox", {})
-        bbox_left_var.set(str(bbox.get("left", "")))
-        bbox_bottom_var.set(str(bbox.get("bottom", "")))
-        bbox_right_var.set(str(bbox.get("right", "")))
-        bbox_top_var.set(str(bbox.get("top", "")))
-        # 注意：以下为全局设置（不随单个任务变化），故这里不从任务覆盖 UI 全局控件
-
-    def clear_task_form() -> None:
-        task_name_var.set("")
-        task_enabled_var.set(True)
-        area_type_var.set("admin")
-        country_var.set("中华人民共和国")
-        province_var.set("")
-        city_var.set("")
-        county_var.set("")
-        province_combobox["values"] = get_province_choices()
-        city_combobox["values"] = []
-        county_combobox["values"] = []
-        # radius removed
-        bbox_left_var.set("")
-        bbox_bottom_var.set("")
-        bbox_right_var.set("")
-        bbox_top_var.set("")
-        # 全局设置从 current_config 恢复
-        providers_var.set(current_config["value"].get("provider", SUPPORTED_PROVIDERS[0]))
-        resources_var.set(",".join(current_config["value"].get("resources", [])))
-        page_limit_var.set(str(current_config["value"].get("default_page_limit", 3)))
-        incremental_var.set(bool(current_config["value"].get("incremental", True)))
-        schedule_interval_var.set(str(current_config["value"].get("schedule_interval_days", 1)))
-        export_format_var.set(str(current_config["value"].get("export_format", (current_config["value"].get("export_formats", ["csv"])[0]))))
-
-    def build_task_from_form() -> Dict[str, Any]:
-        task_name = task_name_var.get().strip()
-        if not task_name:
-            raise ValueError("任务名称不能为空。")
-        # 注意：provider/resources/export_format/page_limit/incremental/schedule 为全局设置，
-        # 不随单个任务存储。此处仅构造任务基本信息（名称、启用、区域/BBox）。
-        area_type = area_type_var.get()
-        task: Dict[str, Any] = {
-            "name": task_name,
-            "enabled": task_enabled_var.get(),
-            "area_type": area_type,
-        }
-        if area_type == "bbox":
-            task["bbox"] = {
-                "left": float(bbox_left_var.get()),
-                "bottom": float(bbox_bottom_var.get()),
-                "right": float(bbox_right_var.get()),
-                "top": float(bbox_top_var.get()),
-            }
-            # no radius for bbox mode
-            task["admin_region"] = {"country": country_var.get().strip(), "province": "", "city": ""}
-        else:
-            task["admin_region"] = {
-                "country": country_var.get().strip(),
-                "province": province_var.get().strip(),
-                "city": city_var.get().strip(),
-            }
-            # center+radius queries removed; do not include radius
-            task["bbox"] = None
-        return task
-        return task
-
-    def save_task_changes() -> None:
-        try:
-            task = build_task_from_form()
-            tasks = current_config["value"].setdefault("tasks", [])
-            index = current_task_index["value"]
-            if index is None:
-                tasks.append(task)
-                append_log(f"已新增任务：{task['name']}")
-            else:
-                tasks[index] = task
-                append_log(f"已更新任务：{task['name']}")
-            save_json(config_var.get(), current_config["value"])
-            refresh_tasks()
-        except Exception as exc:
-            messagebox.showerror("错误", f"保存任务失败：{exc}")
-
-    def add_task() -> None:
-        clear_task_form()
-        current_task_index["value"] = None
-        task_name_var.set(f"新任务_{len(current_config['value'].get('tasks', [])) + 1}")
-
-    def delete_task() -> None:
-        selection = task_list.curselection()
-        if not selection:
-            messagebox.showwarning("提示", "请先选择一个任务。")
-            return
-        index = selection[0]
-        task = current_config["value"].get("tasks", [])[index]
-        if messagebox.askyesno("确认", f"确定删除任务 '{task.get('name')}' 吗？"):
-            current_config["value"]["tasks"].pop(index)
-            save_json(config_var.get(), current_config["value"])
-            refresh_tasks()
-            append_log(f"已删除任务：{task.get('name')}")
-
-    def run_selected() -> None:
-        selection = task_list.curselection()
-        if not selection:
-            messagebox.showwarning("提示", "请先选择一个任务。")
-            return
-        index = selection[0]
-        task = current_config["value"].get("tasks", [])[index]
-        def worker():
-            try:
-                res = run_task(task, current_config["value"], mode="manual")
-                root.after(0, lambda: append_log(json.dumps(res, ensure_ascii=False)))
-            except Exception as e:
-                root.after(0, lambda: append_log(f"任务运行失败: {e}"))
-        try:
-            executor.submit(worker)
-        except Exception:
-            threading.Thread(target=worker, daemon=True).start()
-
-    def run_all_tasks() -> None:
-        def worker_all():
-            try:
-                results = run_tasks(current_config["value"].get("tasks", []), current_config["value"], mode="manual")
-                for entry in results:
-                    root.after(0, lambda e=entry: append_log(json.dumps(e, ensure_ascii=False)))
-            except Exception as e:
-                root.after(0, lambda: append_log(f"批量运行失败: {e}"))
-        try:
-            executor.submit(worker_all)
-        except Exception:
-            threading.Thread(target=worker_all, daemon=True).start()
-
-    def load_log_entries() -> None:
-        logs = load_logs(current_config["value"].get("logs_path", "logs/poi_fetcher_logs.jsonl"))
-        log_text.delete("1.0", "end")
-        for entry in logs[-100:]:
-            append_log(json.dumps(entry, ensure_ascii=False))
-
-    def on_task_select(event: Any) -> None:
-        selection = task_list.curselection()
-        if not selection:
-            return
-        load_task_to_form(selection[0])
-
-    task_list.bind("<<ListboxSelect>>", on_task_select)
-
-    row = 0
-    # 任务名称
-    ttk.Label(editor_frame, text="任务名称：").grid(row=row, column=0, sticky="w")
-    ttk.Entry(editor_frame, textvariable=task_name_var, width=40).grid(row=row, column=1, sticky="w")
-    row += 1
-    # 区域选择模式：行政区域(admin) 或 矩形区域(bbox)
-    ttk.Label(editor_frame, text="选择模式：").grid(row=row, column=0, sticky="w")
-    area_type_combobox = ttk.Combobox(editor_frame, textvariable=area_type_var, values=["admin", "bbox"], width=30, state="readonly")
-    area_type_combobox.grid(row=row, column=1, sticky="w")
-    # 当 area_type_var 改变（程序或用户）时更新控件状态
-    try:
-        area_type_var.trace_add('write', lambda *_: update_area_mode())
-    except Exception:
-        pass
-    def update_area_mode(*_args):
-        mode = area_type_var.get()
-        if mode == "admin":
-            # 启用省市区，禁用 bbox 输入
-            province_combobox.config(state="readonly")
-            city_combobox.config(state="readonly")
-            county_combobox.config(state="readonly")
-            for w in (bbox_left_entry, bbox_bottom_entry, bbox_right_entry, bbox_top_entry):
-                w.config(state="disabled")
-        else:
-            # 矩形模式：禁用省市区，启用 bbox 输入
-            province_combobox.config(state="disabled")
-            city_combobox.config(state="disabled")
-            county_combobox.config(state="disabled")
-            for w in (bbox_left_entry, bbox_bottom_entry, bbox_right_entry, bbox_top_entry):
-                w.config(state="normal")
-    area_type_combobox.bind("<<ComboboxSelected>>", update_area_mode)
-
-    # 将国家行放到选择模式之后的下一行
-    row += 1
-    ttk.Label(editor_frame, text="国家：").grid(row=row, column=0, sticky="w")
-    country_combobox = ttk.Combobox(editor_frame, textvariable=country_var, values=get_country_choices(), width=30, state="readonly")
-    country_combobox.grid(row=row, column=1, sticky="w")
-    country_combobox.bind("<<ComboboxSelected>>", update_province_options)
-    row += 1
-    ttk.Label(editor_frame, text="省份：").grid(row=row, column=0, sticky="w")
-    province_combobox = ttk.Combobox(editor_frame, textvariable=province_var, values=get_province_choices(), width=30, state="readonly")
-    province_combobox.grid(row=row, column=1, sticky="w")
-    province_combobox.bind("<<ComboboxSelected>>", update_city_options)
-    row += 1
-    ttk.Label(editor_frame, text="城市：").grid(row=row, column=0, sticky="w")
-    city_combobox = ttk.Combobox(editor_frame, textvariable=city_var, values=get_city_choices(), width=30, state="readonly")
-    city_combobox.grid(row=row, column=1, sticky="w")
-    city_combobox.bind("<<ComboboxSelected>>", update_county_options)
-    row += 1
-    ttk.Label(editor_frame, text="区/县：").grid(row=row, column=0, sticky="w")
-    county_combobox = ttk.Combobox(editor_frame, textvariable=county_var, values=get_county_choices(), width=30, state="readonly")
-    county_combobox.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Button(editor_frame, text="刷新省市区", command=refresh_region_data).grid(row=row, column=0, columnspan=2, pady=(5, 5), sticky="w")
-    row += 1
-    # 半径功能已移除
-    row += 0
-    ttk.Label(editor_frame, text="BBox 左：").grid(row=row, column=0, sticky="w")
-    bbox_left_entry = ttk.Entry(editor_frame, textvariable=bbox_left_var, width=12)
-    bbox_left_entry.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="BBox 下：").grid(row=row, column=0, sticky="w")
-    bbox_bottom_entry = ttk.Entry(editor_frame, textvariable=bbox_bottom_var, width=12)
-    bbox_bottom_entry.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="BBox 右：").grid(row=row, column=0, sticky="w")
-    bbox_right_entry = ttk.Entry(editor_frame, textvariable=bbox_right_var, width=12)
-    bbox_right_entry.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="BBox 上：").grid(row=row, column=0, sticky="w")
-    bbox_top_entry = ttk.Entry(editor_frame, textvariable=bbox_top_var, width=12)
-    bbox_top_entry.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="Providers：").grid(row=row, column=0, sticky="w")
-    providers_combobox = ttk.Combobox(editor_frame, textvariable=providers_var, values=SUPPORTED_PROVIDERS, width=37, state="readonly")
-    providers_combobox.grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="Resources (逗号分隔)：").grid(row=row, column=0, sticky="w")
-    ttk.Entry(editor_frame, textvariable=resources_var, width=40).grid(row=row, column=1, sticky="w")
-    # 显示可用 resources 示例和关键词示例，帮助用户填写
-    try:
-        cfg_keywords = current_config["value"].get("keywords", {}) if isinstance(current_config.get("value"), dict) else DEFAULT_KEYWORDS
-        resources_example = ", ".join(sorted(cfg_keywords.keys())) if cfg_keywords else ", ".join(RESOURCE_TYPES)
-        kw_examples = "; ".join([f"{k}: {', '.join((v or [])[:3])}" for k, v in cfg_keywords.items()]) if cfg_keywords else "; ".join([f"{k}: {', '.join(v[:3])}" for k, v in DEFAULT_KEYWORDS.items()])
-        help_text = f"可用资源: {resources_example}；关键词示例: {kw_examples}"
-    except Exception:
-        help_text = "可用资源示例见配置文件或文档。"
-    resources_help_label = ttk.Label(editor_frame, text=help_text, foreground="gray", wraplength=420)
-    resources_help_label.grid(row=row+1, column=0, columnspan=2, sticky="w", pady=(2,6))
-    row += 2
-    # 全局：导出格式（单选）
-    ttk.Label(editor_frame, text="导出格式：").grid(row=row, column=0, sticky="w")
-    export_combobox = ttk.Combobox(editor_frame, textvariable=export_format_var, values=["csv", "json", "excel"], width=12, state="readonly")
-    export_combobox.grid(row=row, column=1, sticky="w")
-    row += 1
-    # 并发数（线程池大小）
-    ttk.Label(editor_frame, text="并发数：").grid(row=row, column=0, sticky="w")
-    ttk.Entry(editor_frame, textvariable=concurrency_var, width=12).grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="分页限制：").grid(row=row, column=0, sticky="w")
-    ttk.Entry(editor_frame, textvariable=page_limit_var, width=12).grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Checkbutton(editor_frame, text="增量去重", variable=incremental_var).grid(row=row, column=0, columnspan=2, sticky="w")
-    row += 1
-    ttk.Label(editor_frame, text="调度间隔天数：").grid(row=row, column=0, sticky="w")
-    ttk.Entry(editor_frame, textvariable=schedule_interval_var, width=12).grid(row=row, column=1, sticky="w")
-    row += 1
-    ttk.Button(editor_frame, text="保存任务", command=lambda: save_task_changes()).grid(row=row, column=0, columnspan=2, pady=(10, 0))
-
-    # 初始化区域模式控件状态
-    try:
-        update_area_mode()
-    except Exception:
-        pass
-    load_config_file()
-    root.mainloop()
+    # Tkinter GUI has been removed to avoid depending on tkinter.
+    # Use the PyQt GUI instead by running with `--gui`.
+    print("Tkinter GUI 已移除。请使用 PyQt GUI（运行时加 --gui）。")
 
 
 def create_gui_pyqt(config_path: str) -> None:

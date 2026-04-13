@@ -114,13 +114,17 @@ def create_gui_pyqt(config_path: str) -> None:
     export_combo = QtWidgets.QComboBox()
     export_combo.addItems(["csv", "json", "excel"])
     concurrency_spin = QtWidgets.QSpinBox(); concurrency_spin.setRange(1, 32)
+    province_expand_concurrency_spin = QtWidgets.QSpinBox(); province_expand_concurrency_spin.setRange(1, 64)
+    province_expand_delay_spin = QtWidgets.QDoubleSpinBox(); province_expand_delay_spin.setRange(0.0, 60.0); province_expand_delay_spin.setSingleStep(0.1)
     page_spin = QtWidgets.QSpinBox(); page_spin.setRange(1, 100)
     incr_check = QtWidgets.QCheckBox()
     sched_spin = QtWidgets.QSpinBox(); sched_spin.setRange(1, 365)
-    glob_layout.addRow("Provider：", provider_combo)
-    glob_layout.addRow("Resources：", resources_edit)
+    glob_layout.addRow("提供商：", provider_combo)
+    glob_layout.addRow("资源：", resources_edit)
     glob_layout.addRow("导出格式：", export_combo)
     glob_layout.addRow("并发数：", concurrency_spin)
+    glob_layout.addRow("省展开并发数：", province_expand_concurrency_spin)
+    glob_layout.addRow("省展开延迟(秒)：", province_expand_delay_spin)
     glob_layout.addRow("分页限制：", page_spin)
     glob_layout.addRow("增量去重：", incr_check)
     glob_layout.addRow("调度间隔(天)：", sched_spin)
@@ -176,11 +180,17 @@ def create_gui_pyqt(config_path: str) -> None:
         prov = province_combo.currentText()
         city_combo.clear()
         if prov and prov in region_data:
+            # add '全部' option to allow fetching entire province/city
+            city_combo.addItem("全部")
             city_combo.addItems(sorted(region_data[prov].keys()))
 
     def update_counties():
         prov = province_combo.currentText(); cit = city_combo.currentText()
         county_combo.clear()
+        # if user selected '全部' for city, show only '全部' to represent whole-city fetch
+        if prov and cit == "全部" and prov in region_data:
+            county_combo.addItem("全部")
+            return
         if prov and cit and prov in region_data and cit in region_data[prov]:
             counties = region_data[prov][cit]
             if not counties:
@@ -188,6 +198,8 @@ def create_gui_pyqt(config_path: str) -> None:
                 fetched = fetch_amap_subdistrict(current_cfg.get("api_keys", {}).get("gaode", ""), prov, cit)
                 if fetched:
                     region_data.setdefault(prov, {})[cit] = fetched
+            # add '全部' option to allow fetching entire city when desired
+            county_combo.addItem("全部")
             county_combo.addItems(region_data.get(prov, {}).get(cit, []))
 
     def load_task(idx: int) -> None:
@@ -198,8 +210,13 @@ def create_gui_pyqt(config_path: str) -> None:
         task_name_edit.setText(t.get("name", ""))
         area_type_combo.setCurrentText(t.get("area_type", "admin"))
         province_combo.setCurrentText(t.get("admin_region", {}).get("province", ""))
-        update_cities(); city_combo.setCurrentText(t.get("admin_region", {}).get("city", ""))
-        update_counties(); county_combo.setCurrentText(t.get("admin_region", {}).get("county", ""))
+        update_cities()
+        # map empty-string (saved meaning '全部') to display value '全部'
+        city_val = t.get("admin_region", {}).get("city", "") or "全部"
+        city_combo.setCurrentText(city_val)
+        update_counties()
+        county_val = t.get("admin_region", {}).get("county", "") or "全部"
+        county_combo.setCurrentText(county_val)
         bbox_left.setText(str((t.get("bbox") or {}).get("left", "")))
         bbox_bottom.setText(str((t.get("bbox") or {}).get("bottom", "")))
         bbox_right.setText(str((t.get("bbox") or {}).get("right", "")))
@@ -217,6 +234,8 @@ def create_gui_pyqt(config_path: str) -> None:
             current_cfg["provider"] = provider_combo.currentText()
             current_cfg["resources"] = [r.strip() for r in resources_edit.text().split(",") if r.strip()]
             current_cfg["export_format"] = export_combo.currentText()
+            current_cfg["province_expand_concurrency"] = int(province_expand_concurrency_spin.value())
+            current_cfg["province_expand_delay_seconds"] = float(province_expand_delay_spin.value())
             current_cfg["default_page_limit"] = int(page_spin.value())
             current_cfg["incremental"] = bool(incr_check.isChecked())
             current_cfg["schedule_interval_days"] = int(sched_spin.value())
@@ -253,7 +272,15 @@ def create_gui_pyqt(config_path: str) -> None:
                 task["bbox"] = {"left": float(bbox_left.text() or 0), "bottom": float(bbox_bottom.text() or 0), "right": float(bbox_right.text() or 0), "top": float(bbox_top.text() or 0)}
                 task["admin_region"] = {"country": country_label.text(), "province": "", "city": ""}
             else:
-                task["admin_region"] = {"country": country_label.text(), "province": province_combo.currentText(), "city": city_combo.currentText(), "county": county_combo.currentText()}
+                # map UI '全部' selection to empty string in saved config to indicate whole-city/whole-province
+                prov = province_combo.currentText()
+                city = city_combo.currentText()
+                county = county_combo.currentText()
+                if city == "全部":
+                    city = ""
+                if county == "全部":
+                    county = ""
+                task["admin_region"] = {"country": country_label.text(), "province": prov, "city": city, "county": county}
                 task["bbox"] = None
             idx = task_list.currentRow()
             tasks = current_cfg.setdefault("tasks", [])
@@ -332,6 +359,8 @@ def create_gui_pyqt(config_path: str) -> None:
     resources_edit.setText(','.join(current_cfg.get("resources", [])))
     export_combo.setCurrentText(str(current_cfg.get("export_format", export_combo.currentText())))
     page_spin.setValue(int(current_cfg.get("default_page_limit", page_spin.value())))
+    province_expand_concurrency_spin.setValue(int(current_cfg.get("province_expand_concurrency", province_expand_concurrency_spin.value())))
+    province_expand_delay_spin.setValue(float(current_cfg.get("province_expand_delay_seconds", province_expand_delay_spin.value())))
     incr_check.setChecked(bool(current_cfg.get("incremental", incr_check.isChecked())))
     sched_spin.setValue(int(current_cfg.get("schedule_interval_days", sched_spin.value())))
     update_provinces(); update_cities(); update_counties(); refresh_task_list()

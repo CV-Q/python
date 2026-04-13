@@ -2,3 +2,14 @@
 {"time": "2026-04-13T15:54:27.719483", "action": "test_fetch_counties", "province": "河南省", "city": "洛阳市", "counties": []}
 {"time": "2026-04-13T15:54:57.736508", "action": "test_fetch_counties_after_fix", "province": "河南省", "city": "洛阳市", "counties": ["新安县", "栾川县", "洛宁县", "宜阳县", "伊川县", "西工区", "孟津区", "老城区", "瀍河回族区", "涧西区", "洛龙区", "汝阳县", "嵩县", "偃师区"]}
 {"task_name": "唐山_服务区_bbox", "run_time": "2026-04-13T16:37:48", "area": "河北省 / 唐山市 / ", "status": "success", "records": 15, "mode": "manual", "message": "results\\唐山_服务区_bbox_20260413_163748.csv; results\\唐山_服务区_bbox_20260413_163748.json; excel-export-failed: Excel 导出需要 openpyxl，可通过 pip install openpyxl 安装。"}
+{"task_name": "city_all", "run_time": "2026-04-13T18:54:05", "area": "河北 /  / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "county_all", "run_time": "2026-04-13T18:54:05", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "city_all", "run_time": "2026-04-13T18:54:23", "area": "河北 /  / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "county_all", "run_time": "2026-04-13T18:54:23", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "云南丽江加油站", "run_time": "2026-04-13T18:56:31", "area": "云南省 / 丽江市 / ", "status": "success", "records": 56, "mode": "manual", "message": "POI_Data\\2026-04-13\\云南丽江加油站_20260413_185632.csv"}
+{"task_name": "云南丽江加油站", "run_time": "2026-04-13T18:56:44", "area": "云南省 / 丽江市 / ", "status": "success", "records": 56, "mode": "manual", "message": "POI_Data\\2026-04-13\\云南丽江加油站_20260413_185646.csv"}
+{"task_name": "云南加油站", "run_time": "2026-04-13T19:00:17", "area": "云南省 /  / ", "status": "success", "records": 16, "mode": "manual", "message": "POI_Data\\2026-04-13\\云南加油站_20260413_190017.csv"}
+{"task_name": "city_all", "run_time": "2026-04-13T19:08:19", "area": "河北 /  / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "county_all", "run_time": "2026-04-13T19:08:19", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "city_all", "run_time": "2026-04-13T19:11:22", "area": "河北 /  / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
+{"task_name": "county_all", "run_time": "2026-04-13T19:11:22", "area": "河北 / 石家庄 / ", "status": "success", "records": 0, "mode": "manual", "message": "无新增数据。"}
