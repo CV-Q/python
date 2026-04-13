@@ -60,6 +60,10 @@ python map_poi_fetcher.py --help
 - 提交说明：feat: add '全部' UI options; expand province->cities with configurable concurrency/rate-limit; expose in GUI and README
 - 提交时间：2026-04-13
 
+- 新提交哈希：`8ef4265`（短哈希）
+- 提交说明：chore(gui): expose scheduler.check_interval_minutes, localize provider names, resource example, and fix global save button
+- 提交时间：2026-04-13
+
 （如果需要精确回退或查看变更，请在仓库中使用 `git log` 或 `git show 9749040`。）
 
 更新内容（最近提交 9749040）：
