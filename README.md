@@ -53,3 +53,11 @@ python map_poi_fetcher.py --help
 回退与历史：归档文件存放在 `archive/`，如果需要恢复旧实现，可参考其中的备份文件。
 
 作者/维护：项目重构由团队进行，变更已提交到本地 git 仓库。
+
+最新提交记录：
+
+- 提交哈希：`9749040`（短哈希）
+- 提交说明：feat: add '全部' UI options; expand province->cities with configurable concurrency/rate-limit; expose in GUI and README
+- 提交时间：2026-04-13
+
+（如果需要精确回退或查看变更，请在仓库中使用 `git log` 或 `git show 9749040`。）
