@@ -1,16 +1,67 @@
 import argparse
 import csv
 import json
+import math
+import os
 import sys
-import tkinter as tk
+import threading
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
 
-import requests
+try:
+    import requests
+except ImportError:
+    raise ImportError("requests is required. Run 'pip install requests'.")
 
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    tk = None
+
+# --- Constants ---
 SUPPORTED_PROVIDERS = ["baidu", "gaode", "tencent"]
-SUPPORTED_PLACES = ["hospital", "warehouse", "school", "supermarket", "car_repair", "gas_station"]
+RESOURCE_TYPES = ["gas_station", "service_area", "hospital", "repair_factory"]
+DEFAULT_KEYWORDS = {
+    "gas_station": ["加油站"],
+    "service_area": ["服务区"],
+    "hospital": ["医院"],
+    "repair_factory": ["维修工厂", "汽车修理厂"],
+}
+AMAP_TYPE_MAP = {
+    "hospital": "120000",
+    "gas_station": "050700",
+}
+DEFAULT_FIELDS = [
+    "source",
+    "id",
+    "name",
+    "address",
+    "latitude",
+    "longitude",
+    "type",
+    "contact",
+    "task",
+    "run_time",
+]
+
+REGION_DATA = {
+    "北京": ["北京市"],
+    "天津": ["天津市"],
+    "河北": ["石家庄", "唐山", "秦皇岛", "邯郸", "邢台", "保定", "张家口", "承德", "沧州", "廊坊", "衡水"],
+    "山西": ["太原", "大同", "阳泉", "长治", "晋城", "朔州", "晋中", "运城", "忻州", "临汾", "吕梁"],
+    "陕西": ["西安", "铜川", "宝鸡", "咸阳", "渭南", "延安", "汉中", "榆林", "安康", "商洛"],
+    "河南": ["郑州", "开封", "洛阳", "平顶山", "安阳", "鹤壁", "新乡", "焦作", "濮阳", "许昌", "漯河", "三门峡", "南阳", "商丘", "信阳", "周口", "驻马店", "济源"],
+    "湖北": ["武汉", "黄石", "十堰", "宜昌", "襄阳", "鄂州", "荆门", "孝感", "荆州", "黄冈", "咸宁", "随州", "恩施", "仙桃", "潜江", "天门", "神农架"],
+}
+
 CITY_COORDINATES = {
     "石家庄": (38.0428, 114.5149),
     "唐山": (39.6305, 118.1800),
@@ -23,63 +74,293 @@ CITY_COORDINATES = {
     "张家口": (40.8244, 114.8876),
     "承德": (40.9529, 117.9630),
     "廊坊": (39.5209, 116.7037),
+    "太原": (37.8706, 112.5489),
+    "西安": (34.3416, 108.9398),
+    "郑州": (34.7466, 113.6254),
+    "武汉": (30.5928, 114.3055),
 }
 
-PLACE_KEYWORDS = {
-    "hospital": "医院",
-    "warehouse": "仓库",
-    "school": "学校",
-    "supermarket": "超市",
-    "car_repair": "汽车修理厂",
-    "gas_station": "加油站",
+DEFAULT_CONFIG = {
+    "api_keys": {"baidu": "", "gaode": "", "tencent": ""},
+    "keywords": DEFAULT_KEYWORDS,
+    "tasks": [],
+    "auto_start": False,
+    "scheduler": {"enabled": True, "check_interval_minutes": 15},
+    "results_dir": "POI_Data",
+    "logs_path": "logs/poi_fetcher_logs.jsonl",
+    # global defaults (single provider, single export format, resources list, paging, incremental, schedule interval)
+    "provider": SUPPORTED_PROVIDERS[0],
+    "resources": ["gas_station"],
+    "export_format": "csv",
+    "export_formats": ["csv", "json", "excel"],
+    "default_page_limit": 3,
+    "incremental": True,
+    "schedule_interval_days": 1,
 }
 
-AMAP_TYPES = {
-    "hospital": "120000",
-    "warehouse": "190300",
-    "school": "120100",
-    "supermarket": "060400",
-    "car_repair": "050400",
-    "gas_station": "050700",
-}
+X_PI = math.pi * 3000.0 / 180.0
 
-DEFAULT_FIELDS = ["source", "id", "name", "address", "latitude", "longitude", "type"]
+# --- Utility functions ---
+
+def ensure_parent_dir(path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_keys(path: str) -> Dict[str, str]:
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"配置文件未找到: {config_path}")
-    with config_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {
-        "baidu": data.get("baidu_api_key", ""),
-        "gaode": data.get("gaode_api_key", ""),
-        "tencent": data.get("tencent_api_key", ""),
+def load_json(path: str) -> Any:
+    if not Path(path).exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path: str, data: Any) -> None:
+    ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def create_default_config(path: str) -> Dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+    config["api_keys"] = config["api_keys"].copy()
+    config["keywords"] = {k: v.copy() for k, v in DEFAULT_KEYWORDS.items()}
+    save_json(path, config)
+    return config
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    config = load_json(path)
+    if config is None:
+        config = create_default_config(path)
+    if "keywords" not in config:
+        config["keywords"] = {k: v.copy() for k, v in DEFAULT_KEYWORDS.items()}
+    if "tasks" not in config:
+        config["tasks"] = []
+    if "api_keys" not in config:
+        config["api_keys"] = {"baidu": "", "gaode": "", "tencent": ""}
+    if "results_dir" not in config:
+        config["results_dir"] = "results"
+    if "logs_path" not in config:
+        config["logs_path"] = "logs/poi_fetcher_logs.jsonl"
+    if "export_formats" not in config:
+        config["export_formats"] = ["csv", "json", "excel"]
+    if "default_page_limit" not in config:
+        config["default_page_limit"] = 3
+    if "scheduler" not in config:
+        config["scheduler"] = {"enabled": True, "check_interval_minutes": 15}
+    return config
+
+
+def get_region_cache_path(config_path: str) -> str:
+    return str(Path(config_path).with_name("region_cache.json"))
+
+
+def load_region_cache(path: str) -> Dict[str, Any]:
+    data = load_json(path)
+    return data if isinstance(data, dict) else {}
+
+
+def save_region_cache(path: str, data: Dict[str, Any]) -> None:
+    ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def fetch_amap_region_hierarchy(key: str) -> Dict[str, Dict[str, List[str]]]:
+    if not key:
+        raise ValueError("高德 API Key 未配置，无法获取行政区数据。")
+    params = {
+        "key": key,
+        "keywords": "中国",
+        "subdistrict": 3,
+        "extensions": "base",
+        "output": "json",
     }
+    resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "1":
+        raise RuntimeError(f"高德行政区数据接口返回错误: {data}")
+    result: Dict[str, Dict[str, List[str]]] = {}
+    provinces = data.get("districts", [])
+    for province in provinces:
+        province_name = province.get("name", "")
+        if not province_name:
+            continue
+        result[province_name] = {}
+        for city in province.get("districts", []):
+            city_name = city.get("name", "")
+            if not city_name:
+                continue
+            counties = [district.get("name", "") for district in city.get("districts", []) if district.get("name")]
+            result[province_name][city_name] = counties
+    return result
 
 
-def normalize_record(source: str, element: Dict[str, Any], place_type: str) -> Dict[str, Any]:
+def fetch_amap_subdistrict(key: str, province: str, city: str) -> List[str]:
+    """Fetch county/district list for a given province+city from Amap (subdistrict=1).
+
+    Returns a list of county names (may be empty).
+    """
+    if not key:
+        return []
+    params = {
+        "key": key,
+        "keywords": city,
+        "subdistrict": 1,
+        "extensions": "base",
+        "output": "json",
+    }
+    resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "1":
+        return []
+    # data['districts'] may contain multiple provinces; try to find matching province
+    for prov in data.get("districts", []):
+        prov_name = prov.get("name", "")
+        # match by provided province or accept if only one province returned
+        if prov_name and (prov_name == province or len(data.get("districts", [])) == 1):
+            # If the returned top-level item is the city itself (common when searching by city name),
+            # then its child districts are the counties we want.
+            if prov_name == city:
+                return [d.get("name") for d in prov.get("districts", []) if d.get("name")]
+            for cit in prov.get("districts", []):
+                if cit.get("name") == city:
+                    return [d.get("name") for d in cit.get("districts", []) if d.get("name")]
+    # fallback: try first district's child that matches city
+    for prov in data.get("districts", []):
+        for cit in prov.get("districts", []):
+            if cit.get("name") == city:
+                return [d.get("name") for d in cit.get("districts", []) if d.get("name")]
+    return []
+
+
+def ensure_region_data(config_path: str, api_key: str) -> Dict[str, Dict[str, List[str]]]:
+    cache_path = get_region_cache_path(config_path)
+    cache = load_region_cache(cache_path)
+    # normalize cache structure so that result is {province: {city: [counties...]}}
+    def normalize(raw: Dict[str, Any]) -> Dict[str, Dict[str, List[str]]]:
+        if not isinstance(raw, dict):
+            return {}
+        # If top-level is a single country key (e.g. '中华人民共和国'), unwrap it.
+        # Also handle the case where the country key maps to a LIST of province names
+        # (some cached formats use that), by converting it to a province->{} map.
+        if len(raw) == 1:
+            first = next(iter(raw))
+            if first in ("中国", "中华人民共和国"):
+                val = raw[first]
+                if isinstance(val, dict):
+                    raw = val
+                elif isinstance(val, list):
+                    raw = {str(prov): {} for prov in val}
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for prov, val in raw.items():
+            # if value is a list of city names, convert to {city: []}
+            if isinstance(val, list):
+                out[prov] = {str(city): [] for city in val}
+            elif isinstance(val, dict):
+                # if inner dict maps city -> list (counties) keep, else coerce
+                inner: Dict[str, List[str]] = {}
+                for city, sub in val.items():
+                    if isinstance(sub, list):
+                        inner[str(city)] = [str(x) for x in sub]
+                    else:
+                        inner[str(city)] = []
+                out[prov] = inner
+            else:
+                out[prov] = {}
+        return out
+
+    if cache:
+        return normalize(cache)
+
+    try:
+        fetched = fetch_amap_region_hierarchy(api_key)
+        normalized = normalize(fetched)
+        try:
+            save_region_cache(cache_path, fetched)
+        except Exception:
+            pass
+        return normalized
+    except Exception:
+        fallback: Dict[str, Dict[str, List[str]]] = {}
+        for province, cities in REGION_DATA.items():
+            fallback[province] = {city: [] for city in cities}
+        return fallback
+
+
+def bd09_to_gcj02(lng: float, lat: float) -> (float, float):
+    x = lng - 0.0065
+    y = lat - 0.006
+    z = math.sqrt(x * x + y * y) - 0.00002 * math.sin(y * X_PI)
+    theta = math.atan2(y, x) - 0.000003 * math.cos(x * X_PI)
+    return z * math.cos(theta), z * math.sin(theta)
+
+
+def merge_keywords(config: Dict[str, Any], resource_type: str) -> List[str]:
+    keywords = config.get("keywords", {}).get(resource_type, [])
+    if not keywords:
+        keywords = DEFAULT_KEYWORDS.get(resource_type, [])
+    return list(dict.fromkeys(keywords))
+
+
+def get_city_center(province: str, city: str) -> Optional[Dict[str, float]]:
+    if city in CITY_COORDINATES:
+        lat, lon = CITY_COORDINATES[city]
+        return {"latitude": lat, "longitude": lon}
+    return None
+
+
+def build_area_description(task: Dict[str, Any]) -> str:
+    if task.get("area_type") == "bbox":
+        bbox = task.get("bbox", {})
+        return f"bbox({bbox.get('left')},{bbox.get('top')},{bbox.get('right')},{bbox.get('bottom')})"
+    admin = task.get("admin_region", {})
+    return f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}".strip()
+
+
+def task_target_values(task: Dict[str, Any]) -> Dict[str, Any]:
+    if task.get("area_type") == "bbox":
+        return {"bbox": task.get("bbox", {}), "latitude": None, "longitude": None}
+    # 对于行政区任务，不再使用中心+半径查询；由 provider 使用 admin_region 的 city/province 执行区域内搜索
+    return {"bbox": None, "latitude": None, "longitude": None}
+
+
+def get_task_area_summary(task: Dict[str, Any]) -> str:
+    if task.get("area_type") == "bbox":
+        bbox = task.get("bbox", {})
+        return f"BBox {bbox.get('left')} , {bbox.get('bottom')} -> {bbox.get('right')} , {bbox.get('top')}"
+    admin = task.get("admin_region", {})
+    return f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}"
+
+
+def format_time(dt: Optional[datetime]) -> str:
+    return dt.isoformat(timespec="seconds") if dt else ""
+
+
+def normalize_record(source: str, element: Dict[str, Any], place_type: str, task_name: str, run_time: str) -> Dict[str, Any]:
+    latitude = element.get("latitude") or element.get("lat") or element.get("location_lat")
+    longitude = element.get("longitude") or element.get("lng") or element.get("location_lng")
+    if source == "baidu" and latitude is not None and longitude is not None:
+        longitude, latitude = bd09_to_gcj02(float(longitude), float(latitude))
     return {
         "source": source,
-        "id": element.get("id") or element.get("uid") or element.get("id"),
+        "id": element.get("id") or element.get("uid") or element.get("sid") or "",
         "name": element.get("name", ""),
         "address": element.get("address", ""),
-        "latitude": element.get("latitude") or element.get("lat") or element.get("location_lat"),
-        "longitude": element.get("longitude") or element.get("lng") or element.get("location_lng"),
+        "latitude": float(latitude) if latitude is not None else None,
+        "longitude": float(longitude) if longitude is not None else None,
         "type": place_type,
+        "contact": element.get("contact", "") or element.get("telephone", "") or element.get("tel", ""),
+        "task": task_name,
+        "run_time": run_time,
     }
 
 
-def fetch_baidu(key: str, place_type: str, latitude: Optional[float], longitude: Optional[float], radius: Optional[int], bbox: Optional[Dict[str, float]] = None, page_limit: int = 5) -> List[Dict[str, Any]]:
+def fetch_baidu(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
     if not key:
         raise ValueError("百度 API Key 未配置。")
-
-    if bbox is None and (latitude is None or longitude is None or radius is None):
-        raise ValueError("百度查询需要提供圆形参数或矩形 bbox 参数。")
-
-    keyword = PLACE_KEYWORDS[place_type]
-    result = []
+    result: List[Dict[str, Any]] = []
     for page in range(0, page_limit):
         params = {
             "query": keyword,
@@ -92,9 +373,18 @@ def fetch_baidu(key: str, place_type: str, latitude: Optional[float], longitude:
         if bbox is not None:
             params["bounds"] = f"{bbox['bottom']},{bbox['left']},{bbox['top']},{bbox['right']}"
         else:
-            params["location"] = f"{latitude},{longitude}"
-            params["radius"] = radius
-        resp = requests.get("http://api.map.baidu.com/place/v2/search", params=params, timeout=15)
+            # 使用行政区城市名作为 region 搜索，避免基于中心点的 radius 查询
+            city = None
+            if admin_region and isinstance(admin_region, dict):
+                city = admin_region.get("city") or admin_region.get("province")
+            if city:
+                params["region"] = city
+            else:
+                # 回退到基于经纬度的半径查询（如果提供）
+                if latitude is not None and longitude is not None:
+                    params["location"] = f"{latitude},{longitude}"
+                    # no radius parameter provided explicitly
+        resp = requests.get("http://api.map.baidu.com/place/v2/search", params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != 0:
@@ -104,31 +394,25 @@ def fetch_baidu(key: str, place_type: str, latitude: Optional[float], longitude:
             break
         for item in results:
             location = item.get("location", {})
-            result.append(normalize_record(
-                "baidu",
-                {
-                    "id": item.get("uid", item.get("id")),
-                    "name": item.get("name", ""),
-                    "address": item.get("address", ""),
-                    "latitude": location.get("lat"),
-                    "longitude": location.get("lng"),
-                },
-                place_type,
-            ))
+            result.append({
+                "id": item.get("uid", item.get("id")),
+                "name": item.get("name", ""),
+                "address": item.get("address", ""),
+                "contact": item.get("telephone", ""),
+                "latitude": location.get("lat"),
+                "longitude": location.get("lng"),
+                "source": "baidu",
+            })
         if len(results) < 20:
             break
     return result
 
 
-def fetch_gaode(key: str, place_type: str, latitude: Optional[float], longitude: Optional[float], radius: Optional[int], bbox: Optional[Dict[str, float]] = None, page_limit: int = 5) -> List[Dict[str, Any]]:
+def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
     if not key:
         raise ValueError("高德 API Key 未配置。")
-
-    if bbox is None and (latitude is None or longitude is None or radius is None):
-        raise ValueError("高德查询需要提供圆形参数或矩形 bbox 参数。")
-
-    types = AMAP_TYPES.get(place_type, "")
-    result = []
+    result: List[Dict[str, Any]] = []
+    types = AMAP_TYPE_MAP.get(place_type)
     for page in range(1, page_limit + 1):
         if bbox is not None:
             url = "https://restapi.amap.com/v3/place/polygon"
@@ -141,23 +425,40 @@ def fetch_gaode(key: str, place_type: str, latitude: Optional[float], longitude:
             params = {
                 "key": key,
                 "polygon": polygon,
-                "keywords": PLACE_KEYWORDS[place_type],
+                "keywords": keyword,
                 "offset": 20,
                 "page": page,
                 "extensions": "base",
             }
         else:
-            url = "https://restapi.amap.com/v3/place/around"
-            params = {
-                "key": key,
-                "location": f"{longitude},{latitude}",
-                "keywords": PLACE_KEYWORDS[place_type],
-                "radius": radius,
-                "offset": 20,
-                "page": page,
-                "extensions": "base",
-            }
-        resp = requests.get(url, params=params, timeout=15)
+            # 使用按城市文本检索替代基于中心点的 around 搜索，避免 radius
+            city = None
+            if admin_region and isinstance(admin_region, dict):
+                city = admin_region.get("city") or admin_region.get("province")
+            if city:
+                url = "https://restapi.amap.com/v3/place/text"
+                params = {
+                    "key": key,
+                    "keywords": keyword,
+                    "city": city,
+                    "offset": 20,
+                    "page": page,
+                    "extensions": "base",
+                }
+            else:
+                url = "https://restapi.amap.com/v3/place/around"
+                params = {
+                    "key": key,
+                    "location": f"{longitude},{latitude}",
+                    "keywords": keyword,
+                    "radius": None,
+                    "offset": 20,
+                    "page": page,
+                    "extensions": "base",
+                }
+        if types:
+            params["types"] = types
+        resp = requests.get(url, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != "1":
@@ -168,36 +469,36 @@ def fetch_gaode(key: str, place_type: str, latitude: Optional[float], longitude:
         for item in pois:
             location = item.get("location", "")
             lng, lat = (location.split(",") + [""])[:2]
-            result.append(normalize_record(
-                "gaode",
-                {
-                    "id": item.get("id", item.get("uid")),
-                    "name": item.get("name", ""),
-                    "address": item.get("address", "") or item.get("pname", "") + item.get("cityname", "") + item.get("adname", ""),
-                    "latitude": float(lat) if lat else None,
-                    "longitude": float(lng) if lng else None,
-                },
-                place_type,
-            ))
+            result.append({
+                "id": item.get("id", item.get("uid")),
+                "name": item.get("name", ""),
+                "address": item.get("address", "") or item.get("pname", "") + item.get("cityname", "") + item.get("adname", ""),
+                "contact": item.get("tel", ""),
+                "latitude": float(lat) if lat else None,
+                "longitude": float(lng) if lng else None,
+                "source": "gaode",
+            })
         if len(pois) < 20:
             break
     return result
 
 
-def fetch_tencent(key: str, place_type: str, latitude: Optional[float], longitude: Optional[float], radius: Optional[int], bbox: Optional[Dict[str, float]] = None, page_limit: int = 5) -> List[Dict[str, Any]]:
+def fetch_tencent(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
     if not key:
         raise ValueError("腾讯 API Key 未配置。")
-
-    if bbox is None and (latitude is None or longitude is None or radius is None):
-        raise ValueError("腾讯查询需要提供圆形参数或矩形 bbox 参数。")
-
-    keyword = PLACE_KEYWORDS[place_type]
-    result = []
+    result: List[Dict[str, Any]] = []
     for page in range(1, page_limit + 1):
         if bbox is not None:
             boundary = f"rectangle({bbox['bottom']},{bbox['left']},{bbox['top']},{bbox['right']})"
         else:
-            boundary = f"nearby({latitude},{longitude},{radius})"
+            # 使用区域(region)搜索以避免基于中心的 nearby(radius) 查询
+            city = None
+            if admin_region and isinstance(admin_region, dict):
+                city = admin_region.get("city") or admin_region.get("province")
+            if city:
+                boundary = f"region({city},0)"
+            else:
+                boundary = f"nearby({latitude},{longitude},0)"
         params = {
             "keyword": keyword,
             "boundary": boundary,
@@ -206,7 +507,7 @@ def fetch_tencent(key: str, place_type: str, latitude: Optional[float], longitud
             "page_index": page,
             "orderby": "nearest",
         }
-        resp = requests.get("https://apis.map.qq.com/ws/place/v1/search", params=params, timeout=15)
+        resp = requests.get("https://apis.map.qq.com/ws/place/v1/search", params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != 0:
@@ -216,322 +517,873 @@ def fetch_tencent(key: str, place_type: str, latitude: Optional[float], longitud
             break
         for item in pois:
             location = item.get("location", {})
-            result.append(normalize_record(
-                "tencent",
-                {
-                    "id": item.get("id"),
-                    "name": item.get("title", ""),
-                    "address": item.get("address", ""),
-                    "latitude": location.get("lat"),
-                    "longitude": location.get("lng"),
-                },
-                place_type,
-            ))
+            result.append({
+                "id": item.get("id"),
+                "name": item.get("title", ""),
+                "address": item.get("address", ""),
+                "contact": item.get("tel", ""),
+                "latitude": location.get("lat"),
+                "longitude": location.get("lng"),
+                "source": "tencent",
+            })
         if len(pois) < 20:
             break
     return result
 
 
-def save_to_csv(records: List[Dict[str, Any]], path: str, warn_callback=None) -> Path:
+def fetch_provider_records(provider: str, api_keys: Dict[str, str], keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int) -> List[Dict[str, Any]]:
+    if provider == "baidu":
+        return fetch_baidu(api_keys.get("baidu", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
+    if provider == "gaode":
+        return fetch_gaode(api_keys.get("gaode", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
+    if provider == "tencent":
+        return fetch_tencent(api_keys.get("tencent", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
+    raise ValueError(f"不支持的 provider: {provider}")
+
+
+def build_record_key(record: Dict[str, Any]) -> str:
+    name = (record.get("name") or "").strip().lower()
+    lat = record.get("latitude")
+    lng = record.get("longitude")
+    if lat is None or lng is None:
+        return name
+    return f"{name}|{round(float(lat), 6)}|{round(float(lng), 6)}"
+
+
+def dedupe_records(records: List[Dict[str, Any]], existing_keys: Optional[set] = None) -> List[Dict[str, Any]]:
+    existing_keys = existing_keys or set()
+    deduped: List[Dict[str, Any]] = []
+    seen = set(existing_keys)
+    for record in records:
+        key = build_record_key(record)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(record)
+    return deduped
+
+
+def load_existing_keys(results_dir: str) -> set:
+    keys = set()
+    path = Path(results_dir)
+    if not path.exists():
+        return keys
+    for file_path in path.iterdir():
+        if file_path.suffix.lower() == ".csv":
+            with file_path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    keys.add(build_record_key(row))
+        elif file_path.suffix.lower() == ".json":
+            try:
+                data = json.loads(file_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for row in data:
+                        keys.add(build_record_key(row))
+            except Exception:
+                continue
+    return keys
+
+
+def save_to_csv(records: List[Dict[str, Any]], path: str) -> str:
     filepath = Path(path)
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    write_path = filepath
-    write_header = True
-    mode = "w"
-
-    if filepath.exists():
-        with filepath.open("r", encoding="utf-8-sig", newline="") as csvfile:
-            reader = csv.reader(csvfile)
-            try:
-                existing_header = next(reader)
-            except StopIteration:
-                existing_header = []
-
-        if existing_header == DEFAULT_FIELDS:
-            mode = "a"
-            write_header = False
-        else:
-            new_path = filepath.with_name(filepath.stem + "_new" + filepath.suffix)
-            warning = (
-                f"目标 CSV 文件 {filepath} 的表头与预期不一致。"
-                f"已改为创建新文件 {new_path} 并写入数据。\n"
-            )
-            if warn_callback:
-                warn_callback(warning)
-            else:
-                print(warning)
-            write_path = new_path
-            mode = "w"
-            write_header = True
-
-    with write_path.open(mode, encoding="utf-8-sig", newline="") as csvfile:
+    with filepath.open("w", encoding="utf-8-sig", newline="") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=DEFAULT_FIELDS)
-        if write_header:
-            writer.writeheader()
+        writer.writeheader()
         for record in records:
-            writer.writerow(record)
-    return write_path
+            writer.writerow({field: record.get(field, "") for field in DEFAULT_FIELDS})
+    return str(filepath)
 
 
-def save_to_json(records: List[Dict[str, Any]], path: str) -> Path:
+def save_to_json(records: List[Dict[str, Any]], path: str) -> str:
     filepath = Path(path)
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with filepath.open("w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
-    return filepath
+    return str(filepath)
 
 
-def run_fetch(provider: str, keys: Dict[str, str], place_type: str, latitude: Optional[float], longitude: Optional[float], radius: Optional[int], bbox: Optional[Dict[str, float]], output: str, json_output: Optional[str], page_limit: int, log_callback=None) -> None:
-    def log(msg: str) -> None:
-        if log_callback:
-            log_callback(msg)
-        else:
-            print(msg)
+def save_to_excel(records: List[Dict[str, Any]], path: str) -> str:
+    if openpyxl is None:
+        raise ImportError("Excel 导出需要 openpyxl，可通过 pip install openpyxl 安装。")
+    filepath = Path(path)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(DEFAULT_FIELDS)
+    for record in records:
+        sheet.append([record.get(field, "") for field in DEFAULT_FIELDS])
+    workbook.save(filepath)
+    return str(filepath)
 
-    providers = SUPPORTED_PROVIDERS if provider == "all" else [provider]
-    all_records: List[Dict[str, Any]] = []
-    for current in providers:
-        log(f"=== 查询 {current} {place_type} ===\n")
+
+def append_log(log_path: str, entry: Dict[str, Any]) -> None:
+    filepath = Path(log_path)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with filepath.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_logs(log_path: str) -> List[Dict[str, Any]]:
+    logs: List[Dict[str, Any]] = []
+    path = Path(log_path)
+    if not path.exists():
+        return logs
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                logs.append(json.loads(line.strip()))
+            except Exception:
+                continue
+    return logs
+
+
+def export_logs(logs: List[Dict[str, Any]], export_path: str) -> str:
+    path = Path(export_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".csv":
+        fields = ["task_name", "run_time", "area", "status", "records", "mode", "message"]
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for log_entry in logs:
+                writer.writerow({k: log_entry.get(k, "") for k in fields})
+    else:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2)
+    return str(path)
+
+
+def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual") -> Dict[str, Any]:
+    run_time = format_time(datetime.now())
+    task_name = task.get("name", task.get("task_name", "unnamed_task"))
+    area = get_task_area_summary(task)
+    page_limit = int(config.get("default_page_limit", 3))
+    # providers and resources are global settings now (in config)
+    prov = config.get("provider")
+    if isinstance(config.get("providers"), list) and config.get("providers"):
+        providers = config.get("providers")
+    elif prov:
+        providers = [prov]
+    else:
+        providers = SUPPORTED_PROVIDERS
+    if task.get("area_type") == "admin" and not task.get("admin_region"):
+        raise ValueError("行政区域任务必须包含 admin_region 配置。")
+    if task.get("area_type") == "bbox" and not task.get("bbox"):
+        raise ValueError("BBox 任务必须包含 bbox 配置。")
+    target = task_target_values(task)
+    keywords = []
+    for resource in config.get("resources", []):
+        keywords.extend(merge_keywords(config, resource))
+    keywords = list(dict.fromkeys(keywords))
+    records: List[Dict[str, Any]] = []
+    for keyword in keywords:
+        for provider in providers:
+            try:
+                provider_records = fetch_provider_records(
+                    provider,
+                    config.get("api_keys", {}),
+                    keyword,
+                    task.get("resource_type", ""),
+                    target.get("latitude"),
+                    target.get("longitude"),
+                    target.get("bbox"),
+                    task.get("admin_region") if task.get("area_type") == "admin" else None,
+                    page_limit,
+                )
+            except Exception as exc:
+                entry = {
+                    "task_name": task_name,
+                    "run_time": run_time,
+                    "area": area,
+                    "status": "failed",
+                    "records": 0,
+                    "mode": mode,
+                    "message": str(exc),
+                }
+                append_log(config["logs_path"], entry)
+                return entry
+            for item in provider_records:
+                records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+    records = dedupe_records(records)
+    if config.get("incremental", True):
+        existing_keys = load_existing_keys(config.get("results_dir", "POI_Data"))
+        records = dedupe_records(records, existing_keys=existing_keys)
+    if not records:
+        entry = {
+            "task_name": task_name,
+            "run_time": run_time,
+            "area": area,
+            "status": "success",
+            "records": 0,
+            "mode": mode,
+            "message": "无新增数据。",
+        }
+        append_log(config["logs_path"], entry)
+        return entry
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    date_folder = datetime.now().strftime("%Y-%m-%d")
+    base_dir = Path(config.get("results_dir", "POI_Data"))
+    output_base = base_dir / date_folder / f"{task_name}_{timestamp}"
+    saved_paths: List[str] = []
+    # determine export formats: prefer single global `export_format`, fall back to legacy list
+    formats: List[str] = []
+    if config.get("export_format"):
+        formats = [config.get("export_format")]
+    else:
+        formats = config.get("export_formats", [])
+    if "csv" in formats:
+        saved_paths.append(save_to_csv(records, f"{output_base}.csv"))
+    if "json" in formats:
+        saved_paths.append(save_to_json(records, f"{output_base}.json"))
+    if "excel" in formats:
         try:
-            records = fetch_places(current, keys, place_type, latitude, longitude, radius, bbox, page_limit=page_limit)
-            log(f"从 {current} 获取到 {len(records)} 条结果。\n")
-            all_records.extend(records)
-        except Exception as exc:
-            log(f"{current} 查询失败：{exc}\n")
-    if not all_records:
-        log("未获取到任何数据。\n")
+            saved_paths.append(save_to_excel(records, f"{output_base}.xlsx"))
+        except ImportError as exc:
+            saved_paths.append(f"excel-export-failed: {exc}")
+    entry = {
+        "task_name": task_name,
+        "run_time": run_time,
+        "area": area,
+        "status": "success",
+        "records": len(records),
+        "mode": mode,
+        "message": "; ".join(saved_paths),
+    }
+    append_log(config["logs_path"], entry)
+    return entry
+
+
+def run_tasks(tasks: List[Dict[str, Any]], config: Dict[str, Any], mode: str = "manual") -> List[Dict[str, Any]]:
+    results = []
+    for task in tasks:
+        if not task.get("enabled", True):
+            continue
+        result = run_task(task, config, mode=mode)
+        results.append(result)
+    return results
+
+
+def get_last_run_time(logs: List[Dict[str, Any]], task_name: str) -> Optional[datetime]:
+    filtered = [log for log in logs if log.get("task_name") == task_name and log.get("status") == "success"]
+    if not filtered:
+        return None
+    latest = max(filtered, key=lambda x: x.get("run_time", ""))
+    try:
+        return datetime.fromisoformat(latest["run_time"])
+    except Exception:
+        return None
+
+
+def is_task_due(task: Dict[str, Any], logs: List[Dict[str, Any]], config: Dict[str, Any]) -> bool:
+    # Use task schedule if present, otherwise fall back to global schedule_interval_days in config
+    schedule = task.get("schedule", {"type": "daily", "interval_days": config.get("schedule_interval_days", 1)})
+    if schedule.get("type") != "daily":
+        return False
+    interval = int(schedule.get("interval_days", config.get("schedule_interval_days", 1)))
+    last_run = get_last_run_time(logs, task.get("name", ""))
+    if last_run is None:
+        return True
+    return datetime.now() >= last_run + timedelta(days=interval)
+
+
+def run_scheduled_tasks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not config.get("scheduler", {}).get("enabled", True):
+        return []
+    logs = load_logs(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+    due_tasks = [task for task in config.get("tasks", []) if task.get("enabled", True) and is_task_due(task, logs, config)]
+    return run_tasks(due_tasks, config, mode="scheduled")
+
+
+def start_scheduler(config: Dict[str, Any]) -> threading.Thread:
+    stop_event = threading.Event()
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            try:
+                run_scheduled_tasks(config)
+            except Exception:
+                pass
+            time.sleep(max(60, int(config.get("scheduler", {}).get("check_interval_minutes", 15)) * 60))
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
+
+# --- CLI / GUI ---
+
+def list_tasks(config: Dict[str, Any]) -> None:
+    global_resources = config.get("resources", [])
+    for task in config.get("tasks", []):
+        print(f"- {task.get('name')} (enabled={task.get('enabled', True)}, area={get_task_area_summary(task)}, resources={global_resources})")
+
+
+def show_logs(config: Dict[str, Any], status: Optional[str] = None) -> None:
+    logs = load_logs(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+    for entry in logs:
+        if status and entry.get("status") != status:
+            continue
+        print(json.dumps(entry, ensure_ascii=False))
+
+
+def create_gui(config_path: str) -> None:
+    if tk is None:
+        print("当前环境不支持 Tkinter，无法启动 GUI。")
         return
 
-    saved_csv = save_to_csv(all_records, output, warn_callback=log)
-    log(f"已保存 CSV：{saved_csv}\n")
-    if json_output:
-        saved_json = save_to_json(all_records, json_output)
-        log(f"已保存 JSON：{saved_json}\n")
-
-
-def fetch_places(provider: str, keys: Dict[str, str], place_type: str, latitude: Optional[float], longitude: Optional[float], radius: Optional[int], bbox: Optional[Dict[str, float]], page_limit: int = 5) -> List[Dict[str, Any]]:
-    provider = provider.lower()
-    if provider == "baidu":
-        return fetch_baidu(keys.get("baidu", ""), place_type, latitude, longitude, radius, bbox=bbox, page_limit=page_limit)
-    if provider == "gaode":
-        return fetch_gaode(keys.get("gaode", ""), place_type, latitude, longitude, radius, bbox=bbox, page_limit=page_limit)
-    if provider == "tencent":
-        return fetch_tencent(keys.get("tencent", ""), place_type, latitude, longitude, radius, bbox=bbox, page_limit=page_limit)
-    raise ValueError(f"不支持的 provider: {provider}")
-
-
-def create_gui() -> None:
     root = tk.Tk()
-    root.title("地图 POI 抓取器")
-    root.geometry("720x520")
-    root.resizable(False, False)
+    root.title("POI 任务调度器")
+    root.geometry("1000x700")
 
-    frame = ttk.Frame(root, padding=12)
-    frame.pack(fill="both", expand=True)
+    main_frame = ttk.Frame(root, padding=10)
+    main_frame.pack(fill="both", expand=True)
 
-    ttk.Label(frame, text="地图服务：").grid(row=0, column=0, sticky="w")
-    provider_var = tk.StringVar(value="all")
-    provider_menu = ttk.Combobox(frame, textvariable=provider_var, values=["all"] + SUPPORTED_PROVIDERS, state="readonly", width=18)
-    provider_menu.grid(row=0, column=1, sticky="w", pady=(0, 6))
+    config_var = tk.StringVar(value=config_path)
+    ttk.Label(main_frame, text="配置文件：").grid(row=0, column=0, sticky="w")
+    ttk.Entry(main_frame, textvariable=config_var, width=60).grid(row=0, column=1, sticky="w")
+    ttk.Button(main_frame, text="刷新配置", command=lambda: load_config_file()).grid(row=0, column=2, sticky="w")
+    ttk.Button(main_frame, text="保存配置", command=lambda: save_current_config()).grid(row=0, column=3, sticky="w")
 
-    ttk.Label(frame, text="地点类型：").grid(row=0, column=2, sticky="w", padx=(12, 0))
-    type_var = tk.StringVar(value="hospital")
-    type_menu = ttk.Combobox(frame, textvariable=type_var, values=SUPPORTED_PLACES, state="readonly", width=18)
-    type_menu.grid(row=0, column=3, sticky="w", pady=(0, 6))
+    content_frame = ttk.Frame(main_frame)
+    content_frame.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+    main_frame.rowconfigure(1, weight=1)
+    main_frame.columnconfigure(1, weight=1)
 
-    ttk.Label(frame, text="查询模式：").grid(row=1, column=0, sticky="w")
-    mode_var = tk.StringVar(value="circle")
-    ttk.Radiobutton(frame, text="圆形", variable=mode_var, value="circle").grid(row=1, column=1, sticky="w")
-    ttk.Radiobutton(frame, text="矩形", variable=mode_var, value="bbox").grid(row=1, column=2, sticky="w")
+    task_frame = ttk.LabelFrame(content_frame, text="任务列表与管理", padding=10)
+    task_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    task_frame.rowconfigure(1, weight=1)
+    task_frame.columnconfigure(0, weight=1)
 
-    ttk.Label(frame, text="中心点纬度：").grid(row=2, column=0, sticky="w")
-    lat_var = tk.StringVar()
-    lat_entry = ttk.Entry(frame, textvariable=lat_var, width=20)
-    lat_entry.grid(row=2, column=1, sticky="w")
+    editor_frame = ttk.LabelFrame(content_frame, text="任务详情编辑", padding=10)
+    editor_frame.grid(row=0, column=1, sticky="nsew")
+    content_frame.columnconfigure(1, weight=1)
 
-    ttk.Label(frame, text="中心点经度：").grid(row=2, column=2, sticky="w", padx=(12, 0))
-    lon_var = tk.StringVar()
-    lon_entry = ttk.Entry(frame, textvariable=lon_var, width=20)
-    lon_entry.grid(row=2, column=3, sticky="w")
+    task_list = tk.Listbox(task_frame, width=60, height=20)
+    task_list.grid(row=1, column=0, sticky="nsew")
+    task_scroll = ttk.Scrollbar(task_frame, orient="vertical", command=task_list.yview)
+    task_scroll.grid(row=1, column=1, sticky="ns")
+    task_list.config(yscrollcommand=task_scroll.set)
 
-    ttk.Label(frame, text="半径（米）：").grid(row=3, column=0, sticky="w", pady=(8, 0))
-    radius_var = tk.StringVar(value="2000")
-    radius_entry = ttk.Entry(frame, textvariable=radius_var, width=20)
-    radius_entry.grid(row=3, column=1, sticky="w", pady=(8, 0))
+    task_buttons = ttk.Frame(task_frame)
+    task_buttons.grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky="w")
+    ttk.Button(task_buttons, text="新增任务", command=lambda: add_task()).grid(row=0, column=0, padx=5)
+    ttk.Button(task_buttons, text="删除任务", command=lambda: delete_task()).grid(row=0, column=1, padx=5)
+    ttk.Button(task_buttons, text="运行选中任务", command=lambda: run_selected()).grid(row=0, column=2, padx=5)
+    ttk.Button(task_buttons, text="运行全部任务", command=lambda: run_all_tasks()).grid(row=0, column=3, padx=5)
+    ttk.Button(task_buttons, text="加载日志", command=lambda: load_log_entries()).grid(row=0, column=4, padx=5)
 
-    bbox_frame = ttk.Frame(frame)
-    bbox_frame.grid(row=4, column=0, columnspan=4, pady=(8, 0), sticky="w")
-    ttk.Label(bbox_frame, text="上边界(lat)：").grid(row=0, column=0, sticky="w")
-    top_var = tk.StringVar()
-    top_entry = ttk.Entry(bbox_frame, textvariable=top_var, width=16)
-    top_entry.grid(row=0, column=1, sticky="w")
+    log_frame = ttk.LabelFrame(main_frame, text="日志输出", padding=10)
+    log_frame.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
+    main_frame.rowconfigure(2, weight=1)
 
-    ttk.Label(bbox_frame, text="下边界(lat)：").grid(row=0, column=2, sticky="w", padx=(12, 0))
-    bottom_var = tk.StringVar()
-    bottom_entry = ttk.Entry(bbox_frame, textvariable=bottom_var, width=16)
-    bottom_entry.grid(row=0, column=3, sticky="w")
-
-    ttk.Label(bbox_frame, text="左边界(lon)：").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    left_var = tk.StringVar()
-    left_entry = ttk.Entry(bbox_frame, textvariable=left_var, width=16)
-    left_entry.grid(row=1, column=1, sticky="w", pady=(8, 0))
-
-    ttk.Label(bbox_frame, text="右边界(lon)：").grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
-    right_var = tk.StringVar()
-    right_entry = ttk.Entry(bbox_frame, textvariable=right_var, width=16)
-    right_entry.grid(row=1, column=3, sticky="w", pady=(8, 0))
-
-    def toggle_mode() -> None:
-        mode = mode_var.get()
-        circle_state = "normal" if mode == "circle" else "disabled"
-        bbox_state = "disabled" if mode == "circle" else "normal"
-        lat_entry.configure(state=circle_state)
-        lon_entry.configure(state=circle_state)
-        radius_entry.configure(state=circle_state)
-        top_entry.configure(state=bbox_state)
-        bottom_entry.configure(state=bbox_state)
-        left_entry.configure(state=bbox_state)
-        right_entry.configure(state=bbox_state)
-
-    mode_var.trace_add("write", lambda *args: toggle_mode())
-    toggle_mode()
-
-    ttk.Label(frame, text="API Key 配置：").grid(row=5, column=0, sticky="w", pady=(8, 0))
-    config_var = tk.StringVar(value="map_keys.json")
-    ttk.Entry(frame, textvariable=config_var, width=48).grid(row=5, column=1, columnspan=2, sticky="w", pady=(8, 0))
-    ttk.Button(frame, text="浏览...", command=lambda: choose_file(config_var, [("JSON 文件", "*.json"), ("所有文件", "*")])).grid(row=5, column=3, sticky="w", padx=(6,0), pady=(8,0))
-
-    ttk.Label(frame, text="输出 CSV：").grid(row=6, column=0, sticky="w", pady=(8, 0))
-    output_var = tk.StringVar(value="poi_results.csv")
-    ttk.Entry(frame, textvariable=output_var, width=48).grid(row=6, column=1, columnspan=2, sticky="w", pady=(8, 0))
-    ttk.Button(frame, text="浏览...", command=lambda: save_file(output_var, [("CSV 文件", "*.csv"), ("所有文件", "*")])).grid(row=6, column=3, sticky="w", padx=(6,0), pady=(8,0))
-
-    ttk.Label(frame, text="可选 JSON：").grid(row=7, column=0, sticky="w", pady=(8, 0))
-    json_var = tk.StringVar()
-    ttk.Entry(frame, textvariable=json_var, width=48).grid(row=7, column=1, columnspan=2, sticky="w", pady=(8, 0))
-    ttk.Button(frame, text="浏览...", command=lambda: save_file(json_var, [("JSON 文件", "*.json"), ("所有文件", "*")])).grid(row=7, column=3, sticky="w", padx=(6,0), pady=(8,0))
-
-    ttk.Label(frame, text="分页限制：").grid(row=8, column=0, sticky="w", pady=(8, 0))
-    page_var = tk.StringVar(value="3")
-    ttk.Entry(frame, textvariable=page_var, width=20).grid(row=8, column=1, sticky="w", pady=(8, 0))
-
-    output_text = tk.Text(frame, width=88, height=14, wrap="word")
-    output_scroll = ttk.Scrollbar(frame, orient="vertical", command=output_text.yview)
-    output_text.configure(yscrollcommand=output_scroll.set)
-    output_text.grid(row=9, column=0, columnspan=3, pady=(12, 0), sticky="nsew")
-    output_scroll.grid(row=9, column=3, pady=(12, 0), sticky="ns")
+    log_text = tk.Text(log_frame, width=120, height=12, wrap="word")
+    log_text.pack(fill="both", expand=True)
 
     def append_log(message: str) -> None:
-        output_text.insert("end", message)
-        output_text.see("end")
+        log_text.insert("end", message + "\n")
+        log_text.see("end")
 
-    def clear_log() -> None:
-        output_text.delete("1.0", "end")
+    current_task_index = {"value": None}
+    current_config: Dict[str, Any] = {"value": load_config(config_path)}
+    region_data: Dict[str, Dict[str, List[str]]] = {"value": ensure_region_data(config_path, current_config["value"].get("api_keys", {}).get("gaode", ""))}
 
-    def choose_file(variable: tk.StringVar, filetypes):
-        path = filedialog.askopenfilename(title="选择文件", filetypes=filetypes)
-        if path:
-            variable.set(path)
+    task_name_var = tk.StringVar()
+    task_enabled_var = tk.BooleanVar(value=True)
+    area_type_var = tk.StringVar(value="admin")
+    country_var = tk.StringVar(value="中国")
+    province_var = tk.StringVar()
+    city_var = tk.StringVar()
+    county_var = tk.StringVar()
+    # radius removed per user request (center+radius queries disabled)
+    bbox_left_var = tk.StringVar()
+    bbox_bottom_var = tk.StringVar()
+    bbox_right_var = tk.StringVar()
+    bbox_top_var = tk.StringVar()
+    # Global settings (now shared across all tasks)
+    providers_var = tk.StringVar(value=current_config["value"].get("provider", SUPPORTED_PROVIDERS[0]))
+    resources_var = tk.StringVar(value=",".join(current_config["value"].get("resources", [RESOURCE_TYPES[0]])))
+    page_limit_var = tk.StringVar(value=str(current_config["value"].get("default_page_limit", 3)))
+    incremental_var = tk.BooleanVar(value=bool(current_config["value"].get("incremental", True)))
+    schedule_interval_var = tk.StringVar(value=str(current_config["value"].get("schedule_interval_days", 1)))
+    # single export format (global)
+    export_format_var = tk.StringVar(value=str(current_config["value"].get("export_format", (current_config["value"].get("export_formats", ["csv"])[0]))))
 
-    def save_file(variable: tk.StringVar, filetypes):
-        path = filedialog.asksaveasfilename(title="保存文件", defaultextension=filetypes[0][1].replace("*", ""), filetypes=filetypes)
-        if path:
-            variable.set(path)
+    def get_country_choices() -> List[str]:
+        return ["中华人民共和国"]
+    def get_province_choices() -> List[str]:
+        return sorted(region_data["value"].keys())
+    def get_city_choices() -> List[str]:
+        province = province_var.get().strip()
+        return sorted(region_data["value"].get(province, {}).keys()) if province else []
+    def get_county_choices() -> List[str]:
+        province = province_var.get().strip()
+        city = city_var.get().strip()
+        return sorted(region_data["value"].get(province, {}).get(city, [])) if province and city else []
+    def update_province_options(*_args) -> None:
+        province_combobox["values"] = get_province_choices()
+        if province_var.get() not in province_combobox["values"]:
+            province_var.set("")
+        update_city_options()
+    def update_city_options(*_args) -> None:
+        city_combobox["values"] = get_city_choices()
+        if city_var.get() not in city_combobox["values"]:
+            city_var.set("")
+        update_county_options()
+    def update_county_options(*_args) -> None:
+        # 如果已有县列表则直接使用，否则尝试在线获取并缓存
+        province = province_var.get().strip()
+        city = city_var.get().strip()
+        county_list = get_county_choices()
+        if not county_list and province and city:
+            try:
+                gaode_key = current_config["value"].get("api_keys", {}).get("gaode", "")
+                fetched = fetch_amap_subdistrict(gaode_key, province, city)
+                if fetched:
+                    region_data["value"].setdefault(province, {})[city] = fetched
+                    try:
+                        save_region_cache(get_region_cache_path(config_var.get()), region_data["value"])
+                    except Exception:
+                        pass
+                    append_log(f"已在线获取并缓存区县：{province} / {city} -> {len(fetched)} 项")
+                    county_list = fetched
+            except Exception as exc:
+                append_log(f"获取区县失败：{exc}")
 
-    def on_run() -> None:
-        clear_log()
+        county_combobox["values"] = county_list
+        if county_var.get() not in county_combobox["values"]:
+            county_var.set("")
+    def refresh_region_data() -> None:
         try:
-            provider = provider_var.get()
-            place_type = type_var.get()
-            mode = mode_var.get()
-            lat = float(lat_var.get()) if lat_var.get().strip() else None
-            lon = float(lon_var.get()) if lon_var.get().strip() else None
-            radius = int(radius_var.get()) if radius_var.get().strip() else None
-            top = float(top_var.get()) if top_var.get().strip() else None
-            bottom = float(bottom_var.get()) if bottom_var.get().strip() else None
-            left = float(left_var.get()) if left_var.get().strip() else None
-            right = float(right_var.get()) if right_var.get().strip() else None
-            config_path = config_var.get().strip() or "map_keys.json"
-            output_path = output_var.get().strip() or "poi_results.csv"
-            json_path = json_var.get().strip() or None
-            page = int(page_var.get())
-
-            bbox = None
-            if mode == "bbox":
-                if top is None or bottom is None or left is None or right is None:
-                    raise ValueError("矩形模式下必须填写上、下、左、右边界。")
-                bbox = {"top": top, "bottom": bottom, "left": left, "right": right}
-            else:
-                if lat is None or lon is None or radius is None:
-                    raise ValueError("圆形模式下必须填写中心点和半径。")
-
-            keys = load_keys(config_path)
-            run_fetch(provider, keys, place_type, lat, lon, radius, bbox, output_path, json_path, page, log_callback=append_log)
+            region_data["value"] = ensure_region_data(config_var.get(), current_config["value"].get("api_keys", {}).get("gaode", ""))
+            append_log("已刷新省市区数据。")
+            province_combobox["values"] = get_province_choices()
         except Exception as exc:
-            append_log(f"错误：{exc}\n")
-            messagebox.showerror("运行错误", str(exc))
+            messagebox.showwarning("警告", f"刷新省市区数据失败：{exc}\n已使用本地缓存或默认数据。")
 
-    ttk.Button(frame, text="开始抓取", command=on_run).grid(row=8, column=1, pady=(12, 0), sticky="e")
-    ttk.Button(frame, text="退出", command=root.destroy).grid(row=8, column=2, pady=(12, 0), sticky="w")
+    def load_config_file() -> None:
+        try:
+            current_config["value"] = load_config(config_var.get())
+            region_data["value"] = ensure_region_data(config_var.get(), current_config["value"].get("api_keys", {}).get("gaode", ""))
+            province_combobox["values"] = get_province_choices()
+            city_combobox["values"] = get_city_choices()
+            county_combobox["values"] = get_county_choices()
+            refresh_tasks()
+            # 更新 resources 帮助文本以反映当前配置
+            try:
+                cfg_keywords = current_config["value"].get("keywords", {})
+                resources_example = ", ".join(sorted(cfg_keywords.keys())) if cfg_keywords else ", ".join(RESOURCE_TYPES)
+                kw_examples = "; ".join([f"{k}: {', '.join((v or [])[:3])}" for k, v in cfg_keywords.items()]) if cfg_keywords else "; ".join([f"{k}: {', '.join(v[:3])}" for k, v in DEFAULT_KEYWORDS.items()])
+                resources_help_label.config(text=f"可用资源: {resources_example}；关键词示例: {kw_examples}")
+            except Exception:
+                pass
+            # 将全局设置同步到 UI
+            try:
+                providers_var.set(current_config["value"].get("provider", providers_var.get()))
+                resources_var.set(",".join(current_config["value"].get("resources", [])))
+                export_format_var.set(str(current_config["value"].get("export_format", export_format_var.get())))
+                page_limit_var.set(str(current_config["value"].get("default_page_limit", page_limit_var.get())))
+                incremental_var.set(bool(current_config["value"].get("incremental", incremental_var.get())))
+                schedule_interval_var.set(str(current_config["value"].get("schedule_interval_days", schedule_interval_var.get())))
+            except Exception:
+                pass
+            append_log(f"已加载配置：{config_var.get()}")
+        except Exception as exc:
+            messagebox.showerror("错误", f"加载配置失败：{exc}")
 
-    for i in range(4):
-        frame.grid_columnconfigure(i, weight=1)
-    frame.grid_rowconfigure(9, weight=1)
+    def save_current_config() -> None:
+        try:
+            # 更新 global 设置到 current_config
+            try:
+                current_config["value"]["provider"] = providers_var.get().strip()
+                current_config["value"]["resources"] = [r.strip() for r in resources_var.get().split(",") if r.strip()]
+                current_config["value"]["export_format"] = export_format_var.get().strip()
+                # keep legacy export_formats list untouched
+                current_config["value"]["default_page_limit"] = int(page_limit_var.get() or current_config["value"].get("default_page_limit", 3))
+                current_config["value"]["incremental"] = bool(incremental_var.get())
+                current_config["value"]["schedule_interval_days"] = int(schedule_interval_var.get() or current_config["value"].get("schedule_interval_days", 1))
+            except Exception:
+                pass
+            save_json(config_var.get(), current_config["value"])
+            append_log(f"已保存配置：{config_var.get()}")
+        except Exception as exc:
+            messagebox.showerror("错误", f"保存配置失败：{exc}")
 
+    def format_task_list_item(task: Dict[str, Any]) -> str:
+        # resources display from global configuration
+        global_resources = current_config["value"].get("resources", [])
+        return f"{task.get('name')} | {get_task_area_summary(task)} | resources={global_resources} | enabled={task.get('enabled', True)}"
+
+    def refresh_tasks() -> None:
+        task_list.delete(0, "end")
+        for task in current_config["value"].get("tasks", []):
+            task_list.insert("end", format_task_list_item(task))
+        clear_task_form()
+        current_task_index["value"] = None
+
+    def load_task_to_form(index: int) -> None:
+        task = current_config["value"].get("tasks", [])[index]
+        current_task_index["value"] = index
+        task_name_var.set(task.get("name", ""))
+        task_enabled_var.set(task.get("enabled", True))
+        area_type_var.set(task.get("area_type", "admin"))
+        country_var.set(task.get("admin_region", {}).get("country", "中华人民共和国"))
+        province_var.set(task.get("admin_region", {}).get("province", ""))
+        update_province_options()
+        city_var.set(task.get("admin_region", {}).get("city", ""))
+        update_city_options()
+        county_var.set(task.get("admin_region", {}).get("county", ""))
+        update_county_options()
+        # radius removed; nothing to set
+        bbox = task.get("bbox", {})
+        bbox_left_var.set(str(bbox.get("left", "")))
+        bbox_bottom_var.set(str(bbox.get("bottom", "")))
+        bbox_right_var.set(str(bbox.get("right", "")))
+        bbox_top_var.set(str(bbox.get("top", "")))
+        # 注意：以下为全局设置（不随单个任务变化），故这里不从任务覆盖 UI 全局控件
+
+    def clear_task_form() -> None:
+        task_name_var.set("")
+        task_enabled_var.set(True)
+        area_type_var.set("admin")
+        country_var.set("中华人民共和国")
+        province_var.set("")
+        city_var.set("")
+        county_var.set("")
+        province_combobox["values"] = get_province_choices()
+        city_combobox["values"] = []
+        county_combobox["values"] = []
+        # radius removed
+        bbox_left_var.set("")
+        bbox_bottom_var.set("")
+        bbox_right_var.set("")
+        bbox_top_var.set("")
+        # 全局设置从 current_config 恢复
+        providers_var.set(current_config["value"].get("provider", SUPPORTED_PROVIDERS[0]))
+        resources_var.set(",".join(current_config["value"].get("resources", [])))
+        page_limit_var.set(str(current_config["value"].get("default_page_limit", 3)))
+        incremental_var.set(bool(current_config["value"].get("incremental", True)))
+        schedule_interval_var.set(str(current_config["value"].get("schedule_interval_days", 1)))
+        export_format_var.set(str(current_config["value"].get("export_format", (current_config["value"].get("export_formats", ["csv"])[0]))))
+
+    def build_task_from_form() -> Dict[str, Any]:
+        task_name = task_name_var.get().strip()
+        if not task_name:
+            raise ValueError("任务名称不能为空。")
+        # 注意：provider/resources/export_format/page_limit/incremental/schedule 为全局设置，
+        # 不随单个任务存储。此处仅构造任务基本信息（名称、启用、区域/BBox）。
+        area_type = area_type_var.get()
+        task: Dict[str, Any] = {
+            "name": task_name,
+            "enabled": task_enabled_var.get(),
+            "area_type": area_type,
+        }
+        if area_type == "bbox":
+            task["bbox"] = {
+                "left": float(bbox_left_var.get()),
+                "bottom": float(bbox_bottom_var.get()),
+                "right": float(bbox_right_var.get()),
+                "top": float(bbox_top_var.get()),
+            }
+            # no radius for bbox mode
+            task["admin_region"] = {"country": country_var.get().strip(), "province": "", "city": ""}
+        else:
+            task["admin_region"] = {
+                "country": country_var.get().strip(),
+                "province": province_var.get().strip(),
+                "city": city_var.get().strip(),
+            }
+            # center+radius queries removed; do not include radius
+            task["bbox"] = None
+        return task
+        return task
+
+    def save_task_changes() -> None:
+        try:
+            task = build_task_from_form()
+            tasks = current_config["value"].setdefault("tasks", [])
+            index = current_task_index["value"]
+            if index is None:
+                tasks.append(task)
+                append_log(f"已新增任务：{task['name']}")
+            else:
+                tasks[index] = task
+                append_log(f"已更新任务：{task['name']}")
+            save_json(config_var.get(), current_config["value"])
+            refresh_tasks()
+        except Exception as exc:
+            messagebox.showerror("错误", f"保存任务失败：{exc}")
+
+    def add_task() -> None:
+        clear_task_form()
+        current_task_index["value"] = None
+        task_name_var.set(f"新任务_{len(current_config['value'].get('tasks', [])) + 1}")
+
+    def delete_task() -> None:
+        selection = task_list.curselection()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一个任务。")
+            return
+        index = selection[0]
+        task = current_config["value"].get("tasks", [])[index]
+        if messagebox.askyesno("确认", f"确定删除任务 '{task.get('name')}' 吗？"):
+            current_config["value"]["tasks"].pop(index)
+            save_json(config_var.get(), current_config["value"])
+            refresh_tasks()
+            append_log(f"已删除任务：{task.get('name')}")
+
+    def run_selected() -> None:
+        selection = task_list.curselection()
+        if not selection:
+            messagebox.showwarning("提示", "请先选择一个任务。")
+            return
+        index = selection[0]
+        task = current_config["value"].get("tasks", [])[index]
+        result = run_task(task, current_config["value"], mode="manual")
+        append_log(json.dumps(result, ensure_ascii=False))
+
+    def run_all_tasks() -> None:
+        results = run_tasks(current_config["value"].get("tasks", []), current_config["value"], mode="manual")
+        for entry in results:
+            append_log(json.dumps(entry, ensure_ascii=False))
+
+    def load_log_entries() -> None:
+        logs = load_logs(current_config["value"].get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+        log_text.delete("1.0", "end")
+        for entry in logs[-100:]:
+            append_log(json.dumps(entry, ensure_ascii=False))
+
+    def on_task_select(event: Any) -> None:
+        selection = task_list.curselection()
+        if not selection:
+            return
+        load_task_to_form(selection[0])
+
+    task_list.bind("<<ListboxSelect>>", on_task_select)
+
+    row = 0
+    # 任务名称
+    ttk.Label(editor_frame, text="任务名称：").grid(row=row, column=0, sticky="w")
+    ttk.Entry(editor_frame, textvariable=task_name_var, width=40).grid(row=row, column=1, sticky="w")
+    row += 1
+    # 区域选择模式：行政区域(admin) 或 矩形区域(bbox)
+    ttk.Label(editor_frame, text="选择模式：").grid(row=row, column=0, sticky="w")
+    area_type_combobox = ttk.Combobox(editor_frame, textvariable=area_type_var, values=["admin", "bbox"], width=30, state="readonly")
+    area_type_combobox.grid(row=row, column=1, sticky="w")
+    # 当 area_type_var 改变（程序或用户）时更新控件状态
+    try:
+        area_type_var.trace_add('write', lambda *_: update_area_mode())
+    except Exception:
+        pass
+    def update_area_mode(*_args):
+        mode = area_type_var.get()
+        if mode == "admin":
+            # 启用省市区，禁用 bbox 输入
+            province_combobox.config(state="readonly")
+            city_combobox.config(state="readonly")
+            county_combobox.config(state="readonly")
+            for w in (bbox_left_entry, bbox_bottom_entry, bbox_right_entry, bbox_top_entry):
+                w.config(state="disabled")
+        else:
+            # 矩形模式：禁用省市区，启用 bbox 输入
+            province_combobox.config(state="disabled")
+            city_combobox.config(state="disabled")
+            county_combobox.config(state="disabled")
+            for w in (bbox_left_entry, bbox_bottom_entry, bbox_right_entry, bbox_top_entry):
+                w.config(state="normal")
+    area_type_combobox.bind("<<ComboboxSelected>>", update_area_mode)
+
+    # 将国家行放到选择模式之后的下一行
+    row += 1
+    ttk.Label(editor_frame, text="国家：").grid(row=row, column=0, sticky="w")
+    country_combobox = ttk.Combobox(editor_frame, textvariable=country_var, values=get_country_choices(), width=30, state="readonly")
+    country_combobox.grid(row=row, column=1, sticky="w")
+    country_combobox.bind("<<ComboboxSelected>>", update_province_options)
+    row += 1
+    ttk.Label(editor_frame, text="省份：").grid(row=row, column=0, sticky="w")
+    province_combobox = ttk.Combobox(editor_frame, textvariable=province_var, values=get_province_choices(), width=30, state="readonly")
+    province_combobox.grid(row=row, column=1, sticky="w")
+    province_combobox.bind("<<ComboboxSelected>>", update_city_options)
+    row += 1
+    ttk.Label(editor_frame, text="城市：").grid(row=row, column=0, sticky="w")
+    city_combobox = ttk.Combobox(editor_frame, textvariable=city_var, values=get_city_choices(), width=30, state="readonly")
+    city_combobox.grid(row=row, column=1, sticky="w")
+    city_combobox.bind("<<ComboboxSelected>>", update_county_options)
+    row += 1
+    ttk.Label(editor_frame, text="区/县：").grid(row=row, column=0, sticky="w")
+    county_combobox = ttk.Combobox(editor_frame, textvariable=county_var, values=get_county_choices(), width=30, state="readonly")
+    county_combobox.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Button(editor_frame, text="刷新省市区", command=refresh_region_data).grid(row=row, column=0, columnspan=2, pady=(5, 5), sticky="w")
+    row += 1
+    # 半径功能已移除
+    row += 0
+    ttk.Label(editor_frame, text="BBox 左：").grid(row=row, column=0, sticky="w")
+    bbox_left_entry = ttk.Entry(editor_frame, textvariable=bbox_left_var, width=12)
+    bbox_left_entry.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="BBox 下：").grid(row=row, column=0, sticky="w")
+    bbox_bottom_entry = ttk.Entry(editor_frame, textvariable=bbox_bottom_var, width=12)
+    bbox_bottom_entry.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="BBox 右：").grid(row=row, column=0, sticky="w")
+    bbox_right_entry = ttk.Entry(editor_frame, textvariable=bbox_right_var, width=12)
+    bbox_right_entry.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="BBox 上：").grid(row=row, column=0, sticky="w")
+    bbox_top_entry = ttk.Entry(editor_frame, textvariable=bbox_top_var, width=12)
+    bbox_top_entry.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="Providers：").grid(row=row, column=0, sticky="w")
+    providers_combobox = ttk.Combobox(editor_frame, textvariable=providers_var, values=SUPPORTED_PROVIDERS, width=37, state="readonly")
+    providers_combobox.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="Resources (逗号分隔)：").grid(row=row, column=0, sticky="w")
+    ttk.Entry(editor_frame, textvariable=resources_var, width=40).grid(row=row, column=1, sticky="w")
+    # 显示可用 resources 示例和关键词示例，帮助用户填写
+    try:
+        cfg_keywords = current_config["value"].get("keywords", {}) if isinstance(current_config.get("value"), dict) else DEFAULT_KEYWORDS
+        resources_example = ", ".join(sorted(cfg_keywords.keys())) if cfg_keywords else ", ".join(RESOURCE_TYPES)
+        kw_examples = "; ".join([f"{k}: {', '.join((v or [])[:3])}" for k, v in cfg_keywords.items()]) if cfg_keywords else "; ".join([f"{k}: {', '.join(v[:3])}" for k, v in DEFAULT_KEYWORDS.items()])
+        help_text = f"可用资源: {resources_example}；关键词示例: {kw_examples}"
+    except Exception:
+        help_text = "可用资源示例见配置文件或文档。"
+    resources_help_label = ttk.Label(editor_frame, text=help_text, foreground="gray", wraplength=420)
+    resources_help_label.grid(row=row+1, column=0, columnspan=2, sticky="w", pady=(2,6))
+    row += 2
+    # 全局：导出格式（单选）
+    ttk.Label(editor_frame, text="导出格式：").grid(row=row, column=0, sticky="w")
+    export_combobox = ttk.Combobox(editor_frame, textvariable=export_format_var, values=["csv", "json", "excel"], width=12, state="readonly")
+    export_combobox.grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="分页限制：").grid(row=row, column=0, sticky="w")
+    ttk.Entry(editor_frame, textvariable=page_limit_var, width=12).grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Checkbutton(editor_frame, text="增量去重", variable=incremental_var).grid(row=row, column=0, columnspan=2, sticky="w")
+    row += 1
+    ttk.Label(editor_frame, text="调度间隔天数：").grid(row=row, column=0, sticky="w")
+    ttk.Entry(editor_frame, textvariable=schedule_interval_var, width=12).grid(row=row, column=1, sticky="w")
+    row += 1
+    ttk.Button(editor_frame, text="保存任务", command=lambda: save_task_changes()).grid(row=row, column=0, columnspan=2, pady=(10, 0))
+
+    # 初始化区域模式控件状态
+    try:
+        update_area_mode()
+    except Exception:
+        pass
+    load_config_file()
     root.mainloop()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="统一地图 POI 抓取工具，支持百度、高德、腾讯。")
-    parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS + ["all"], default="all", help="选择地图服务提供商")
-    parser.add_argument("--type", choices=SUPPORTED_PLACES, default="hospital", help="要抓取的地点类型")
-    parser.add_argument("--mode", choices=["circle", "bbox"], default="circle", help="查询模式：circle 表示中心点+半径，bbox 表示矩形区域")
-    parser.add_argument("--lat", type=float, help="中心点纬度，仅 circle 模式有效")
-    parser.add_argument("--lon", type=float, help="中心点经度，仅 circle 模式有效")
-    parser.add_argument("--radius", type=int, default=2000, help="查询半径（米），仅 circle 模式有效")
-    parser.add_argument("--top", type=float, help="矩形区域上边界纬度，仅 bbox 模式有效")
-    parser.add_argument("--bottom", type=float, help="矩形区域下边界纬度，仅 bbox 模式有效")
-    parser.add_argument("--left", type=float, help="矩形区域左边界经度，仅 bbox 模式有效")
-    parser.add_argument("--right", type=float, help="矩形区域右边界经度，仅 bbox 模式有效")
-    parser.add_argument("--config", default="map_keys.json", help="API Key 配置文件路径")
-    parser.add_argument("--output", default="poi_results.csv", help="输出 CSV 文件路径")
-    parser.add_argument("--json", help="可选的 JSON 输出路径")
-    parser.add_argument("--page-limit", type=int, default=3, help="每个平台的分页页数限制（每页 20 条）")
-    parser.add_argument("--gui", action="store_true", help="打开界面模式")
-    args = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="保障资源 POI 抓取与调度工具")
+    parser.add_argument("--config", default="poi_config.json", help="配置文件路径")
+    parser.add_argument("--init-config", action="store_true", help="初始化默认配置文件")
+    parser.add_argument("--list-tasks", action="store_true", help="列出当前配置中的任务")
+    parser.add_argument("--run-all", action="store_true", help="执行全部任务")
+    parser.add_argument("--run-task", help="执行指定任务名称")
+    parser.add_argument("--run-scheduled", action="store_true", help="执行到期的调度任务")
+    parser.add_argument("--show-logs", action="store_true", help="显示日志")
+    parser.add_argument("--export-logs", help="导出日志到 CSV/JSON 文件")
+    parser.add_argument("--add-keyword", nargs=2, metavar=("RESOURCE", "KEYWORD"), help="向资源类型添加关键字")
+    parser.add_argument("--gui", action="store_true", help="启动图形界面")
+    parser.add_argument("--retry-failed", action="store_true", help="重试失败任务")
+    parser.add_argument("--allow-auto-start", action="store_true", help="程序启动时执行调度任务")
+    return parser.parse_args()
 
-    if args.gui or len(sys.argv) == 1:
-        create_gui()
+
+def retry_failed_tasks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    logs = load_logs(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+    failed_names = {entry["task_name"] for entry in logs if entry.get("status") == "failed"}
+    tasks_to_retry = [task for task in config.get("tasks", []) if task.get("name") in failed_names]
+    return run_tasks(tasks_to_retry, config, mode="retry")
+
+
+def main() -> None:
+    args = parse_args()
+    no_cli_flags = not any([
+        args.init_config,
+        args.add_keyword,
+        args.list_tasks,
+        args.run_all,
+        args.run_task,
+        args.run_scheduled,
+        args.show_logs,
+        args.export_logs,
+        args.retry_failed,
+        args.allow_auto_start,
+        args.gui,
+    ])
+    if no_cli_flags:
+        create_gui(args.config)
         return
 
-    bbox = None
-    if args.mode == "bbox":
-        if args.top is None or args.bottom is None or args.left is None or args.right is None:
-            raise ValueError("bbox 模式下必须提供 --top --bottom --left --right。")
-        bbox = {
-            "top": args.top,
-            "bottom": args.bottom,
-            "left": args.left,
-            "right": args.right,
-        }
-    else:
-        if args.lat is None or args.lon is None:
-            raise ValueError("circle 模式下必须提供 --lat 和 --lon。")
-
-    keys = load_keys(args.config)
-    run_fetch(
-        args.provider,
-        keys,
-        args.type,
-        args.lat,
-        args.lon,
-        args.radius,
-        bbox,
-        args.output,
-        args.json,
-        args.page_limit,
-    )
-
+    config = load_config(args.config)
+    if args.init_config:
+        create_default_config(args.config)
+        print(f"已生成默认配置：{args.config}")
+        return
+    if args.add_keyword:
+        resource, keyword = args.add_keyword
+        if resource not in RESOURCE_TYPES:
+            print(f"未知资源类型: {resource}")
+            return
+        keywords = config.setdefault("keywords", {}).setdefault(resource, [])
+        if keyword not in keywords:
+            keywords.append(keyword)
+            save_json(args.config, config)
+            print(f"已添加关键字 '{keyword}' 到资源 {resource}")
+        else:
+            print(f"关键字已存在: {keyword}")
+        return
+    if args.list_tasks:
+        list_tasks(config)
+        return
+    if args.show_logs:
+        show_logs(config)
+        return
+    if args.export_logs:
+        logs = load_logs(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"))
+        exported = export_logs(logs, args.export_logs)
+        print(f"已导出日志：{exported}")
+        return
+    if args.retry_failed:
+        results = retry_failed_tasks(config)
+        for entry in results:
+            print(json.dumps(entry, ensure_ascii=False))
+        return
+    if args.run_task:
+        task = next((task for task in config.get("tasks", []) if task.get("name") == args.run_task), None)
+        if task is None:
+            print(f"未找到任务: {args.run_task}")
+            return
+        result = run_task(task, config, mode="manual")
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if args.run_all:
+        results = run_tasks(config.get("tasks", []), config, mode="manual")
+        for entry in results:
+            print(json.dumps(entry, ensure_ascii=False))
+        return
+    if args.run_scheduled or args.allow_auto_start or config.get("auto_start", False):
+        results = run_scheduled_tasks(config)
+        for entry in results:
+            print(json.dumps(entry, ensure_ascii=False))
+        if not args.gui and not args.run_scheduled:
+            return
+    if args.gui:
+        create_gui(args.config)
+        return
+    if args.allow_auto_start:
+        if config.get("scheduler", {}).get("enabled", True):
+            start_scheduler(config)
+        print("自动调度已启动，按 Ctrl+C 退出。")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("退出。")
+        return
+    print("未指定操作，请使用 --help 查看可用选项。")
 
 if __name__ == "__main__":
     main()

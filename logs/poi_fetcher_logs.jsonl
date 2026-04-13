@@ -1,0 +1,4 @@
+{"time": "2026-04-13T15:42:39.466485", "action": "test_fetch_counties", "province": "河南省", "city": "洛阳市", "counties": []}
+{"time": "2026-04-13T15:54:27.719483", "action": "test_fetch_counties", "province": "河南省", "city": "洛阳市", "counties": []}
+{"time": "2026-04-13T15:54:57.736508", "action": "test_fetch_counties_after_fix", "province": "河南省", "city": "洛阳市", "counties": ["新安县", "栾川县", "洛宁县", "宜阳县", "伊川县", "西工区", "孟津区", "老城区", "瀍河回族区", "涧西区", "洛龙区", "汝阳县", "嵩县", "偃师区"]}
+{"task_name": "唐山_服务区_bbox", "run_time": "2026-04-13T16:37:48", "area": "河北省 / 唐山市 / ", "status": "success", "records": 15, "mode": "manual", "message": "results\\唐山_服务区_bbox_20260413_163748.csv; results\\唐山_服务区_bbox_20260413_163748.json; excel-export-failed: Excel 导出需要 openpyxl，可通过 pip install openpyxl 安装。"}
