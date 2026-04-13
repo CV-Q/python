@@ -1,12 +1,32 @@
 import argparse
 import csv
 import json
+from typing import Any, Dict, List, Optional, Tuple
 import math
-import os
-import sys
-import threading
-import time
 from datetime import datetime, timedelta
+import concurrent.futures as concurrent
+import queue
+import time
+import threading
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from math import radians, cos, sin, asin, sqrt
+from poi_utils import (
+    save_to_csv,
+    save_to_json,
+    save_to_excel,
+    append_log,
+    load_logs,
+    export_logs,
+    build_record_key,
+    dedupe_records,
+    bd09_to_gcj02,
+    normalize_record,
+    merge_keywords,
+    get_city_center,
+)
+from providers import fetch_provider_records
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +45,17 @@ try:
     from tkinter import filedialog, messagebox, ttk
 except ImportError:
     tk = None
+
+try:
+    from PyQt5 import QtWidgets, QtCore
+except Exception:
+    QtWidgets = None
+    QtCore = None
+try:
+    from providers import fetch_provider_records, fetch_baidu, fetch_gaode, fetch_tencent
+except Exception:
+    # providers module may be created during refactor; fallback to names if present
+    pass
 
 # --- Constants ---
 SUPPORTED_PROVIDERS = ["baidu", "gaode", "tencent"]
@@ -96,6 +127,7 @@ DEFAULT_CONFIG = {
     "default_page_limit": 3,
     "incremental": True,
     "schedule_interval_days": 1,
+    "max_concurrency": 1,
 }
 
 X_PI = math.pi * 3000.0 / 180.0
@@ -289,27 +321,6 @@ def ensure_region_data(config_path: str, api_key: str) -> Dict[str, Dict[str, Li
         return fallback
 
 
-def bd09_to_gcj02(lng: float, lat: float) -> (float, float):
-    x = lng - 0.0065
-    y = lat - 0.006
-    z = math.sqrt(x * x + y * y) - 0.00002 * math.sin(y * X_PI)
-    theta = math.atan2(y, x) - 0.000003 * math.cos(x * X_PI)
-    return z * math.cos(theta), z * math.sin(theta)
-
-
-def merge_keywords(config: Dict[str, Any], resource_type: str) -> List[str]:
-    keywords = config.get("keywords", {}).get(resource_type, [])
-    if not keywords:
-        keywords = DEFAULT_KEYWORDS.get(resource_type, [])
-    return list(dict.fromkeys(keywords))
-
-
-def get_city_center(province: str, city: str) -> Optional[Dict[str, float]]:
-    if city in CITY_COORDINATES:
-        lat, lon = CITY_COORDINATES[city]
-        return {"latitude": lat, "longitude": lon}
-    return None
-
 
 def build_area_description(task: Dict[str, Any]) -> str:
     if task.get("area_type") == "bbox":
@@ -338,228 +349,26 @@ def format_time(dt: Optional[datetime]) -> str:
     return dt.isoformat(timespec="seconds") if dt else ""
 
 
-def normalize_record(source: str, element: Dict[str, Any], place_type: str, task_name: str, run_time: str) -> Dict[str, Any]:
-    latitude = element.get("latitude") or element.get("lat") or element.get("location_lat")
-    longitude = element.get("longitude") or element.get("lng") or element.get("location_lng")
-    if source == "baidu" and latitude is not None and longitude is not None:
-        longitude, latitude = bd09_to_gcj02(float(longitude), float(latitude))
-    return {
-        "source": source,
-        "id": element.get("id") or element.get("uid") or element.get("sid") or "",
-        "name": element.get("name", ""),
-        "address": element.get("address", ""),
-        "latitude": float(latitude) if latitude is not None else None,
-        "longitude": float(longitude) if longitude is not None else None,
-        "type": place_type,
-        "contact": element.get("contact", "") or element.get("telephone", "") or element.get("tel", ""),
-        "task": task_name,
-        "run_time": run_time,
-    }
 
 
-def fetch_baidu(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
-    if not key:
-        raise ValueError("百度 API Key 未配置。")
-    result: List[Dict[str, Any]] = []
-    for page in range(0, page_limit):
-        params = {
-            "query": keyword,
-            "output": "json",
-            "page_size": 20,
-            "page_num": page,
-            "ak": key,
-            "scope": 2,
-        }
-        if bbox is not None:
-            params["bounds"] = f"{bbox['bottom']},{bbox['left']},{bbox['top']},{bbox['right']}"
-        else:
-            # 使用行政区城市名作为 region 搜索，避免基于中心点的 radius 查询
-            city = None
-            if admin_region and isinstance(admin_region, dict):
-                city = admin_region.get("city") or admin_region.get("province")
-            if city:
-                params["region"] = city
-            else:
-                # 回退到基于经纬度的半径查询（如果提供）
-                if latitude is not None and longitude is not None:
-                    params["location"] = f"{latitude},{longitude}"
-                    # no radius parameter provided explicitly
-        resp = requests.get("http://api.map.baidu.com/place/v2/search", params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") != 0:
-            raise RuntimeError(f"百度 API 返回错误: {data}")
-        results = data.get("results", [])
-        if not results:
-            break
-        for item in results:
-            location = item.get("location", {})
-            result.append({
-                "id": item.get("uid", item.get("id")),
-                "name": item.get("name", ""),
-                "address": item.get("address", ""),
-                "contact": item.get("telephone", ""),
-                "latitude": location.get("lat"),
-                "longitude": location.get("lng"),
-                "source": "baidu",
-            })
-        if len(results) < 20:
-            break
-    return result
+# provider implementations moved to providers.py
 
 
-def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
-    if not key:
-        raise ValueError("高德 API Key 未配置。")
-    result: List[Dict[str, Any]] = []
-    types = AMAP_TYPE_MAP.get(place_type)
-    for page in range(1, page_limit + 1):
-        if bbox is not None:
-            url = "https://restapi.amap.com/v3/place/polygon"
-            polygon = (
-                f"{bbox['left']},{bbox['top']};"
-                f"{bbox['right']},{bbox['top']};"
-                f"{bbox['right']},{bbox['bottom']};"
-                f"{bbox['left']},{bbox['bottom']}"
-            )
-            params = {
-                "key": key,
-                "polygon": polygon,
-                "keywords": keyword,
-                "offset": 20,
-                "page": page,
-                "extensions": "base",
-            }
-        else:
-            # 使用按城市文本检索替代基于中心点的 around 搜索，避免 radius
-            city = None
-            if admin_region and isinstance(admin_region, dict):
-                city = admin_region.get("city") or admin_region.get("province")
-            if city:
-                url = "https://restapi.amap.com/v3/place/text"
-                params = {
-                    "key": key,
-                    "keywords": keyword,
-                    "city": city,
-                    "offset": 20,
-                    "page": page,
-                    "extensions": "base",
-                }
-            else:
-                url = "https://restapi.amap.com/v3/place/around"
-                params = {
-                    "key": key,
-                    "location": f"{longitude},{latitude}",
-                    "keywords": keyword,
-                    "radius": None,
-                    "offset": 20,
-                    "page": page,
-                    "extensions": "base",
-                }
-        if types:
-            params["types"] = types
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") != "1":
-            raise RuntimeError(f"高德 API 返回错误: {data}")
-        pois = data.get("pois", [])
-        if not pois:
-            break
-        for item in pois:
-            location = item.get("location", "")
-            lng, lat = (location.split(",") + [""])[:2]
-            result.append({
-                "id": item.get("id", item.get("uid")),
-                "name": item.get("name", ""),
-                "address": item.get("address", "") or item.get("pname", "") + item.get("cityname", "") + item.get("adname", ""),
-                "contact": item.get("tel", ""),
-                "latitude": float(lat) if lat else None,
-                "longitude": float(lng) if lng else None,
-                "source": "gaode",
-            })
-        if len(pois) < 20:
-            break
-    return result
+# provider implementations moved to providers.py
 
 
-def fetch_tencent(key: str, keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5) -> List[Dict[str, Any]]:
-    if not key:
-        raise ValueError("腾讯 API Key 未配置。")
-    result: List[Dict[str, Any]] = []
-    for page in range(1, page_limit + 1):
-        if bbox is not None:
-            boundary = f"rectangle({bbox['bottom']},{bbox['left']},{bbox['top']},{bbox['right']})"
-        else:
-            # 使用区域(region)搜索以避免基于中心的 nearby(radius) 查询
-            city = None
-            if admin_region and isinstance(admin_region, dict):
-                city = admin_region.get("city") or admin_region.get("province")
-            if city:
-                boundary = f"region({city},0)"
-            else:
-                boundary = f"nearby({latitude},{longitude},0)"
-        params = {
-            "keyword": keyword,
-            "boundary": boundary,
-            "key": key,
-            "page_size": 20,
-            "page_index": page,
-            "orderby": "nearest",
-        }
-        resp = requests.get("https://apis.map.qq.com/ws/place/v1/search", params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") != 0:
-            raise RuntimeError(f"腾讯 API 返回错误: {data}")
-        pois = data.get("data", [])
-        if not pois:
-            break
-        for item in pois:
-            location = item.get("location", {})
-            result.append({
-                "id": item.get("id"),
-                "name": item.get("title", ""),
-                "address": item.get("address", ""),
-                "contact": item.get("tel", ""),
-                "latitude": location.get("lat"),
-                "longitude": location.get("lng"),
-                "source": "tencent",
-            })
-        if len(pois) < 20:
-            break
-    return result
+# provider implementations moved to providers.py
 
 
-def fetch_provider_records(provider: str, api_keys: Dict[str, str], keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int) -> List[Dict[str, Any]]:
-    if provider == "baidu":
-        return fetch_baidu(api_keys.get("baidu", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
-    if provider == "gaode":
-        return fetch_gaode(api_keys.get("gaode", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
-    if provider == "tencent":
-        return fetch_tencent(api_keys.get("tencent", ""), keyword, place_type, latitude, longitude, bbox, admin_region, page_limit=page_limit)
-    raise ValueError(f"不支持的 provider: {provider}")
+try:
+    # prefer imported provider implementation
+    fetch_provider_records  # type: ignore
+except Exception:
+    # fallback: simple lookup to avoid NameError during refactor
+    def fetch_provider_records(provider: str, api_keys: Dict[str, str], keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int) -> List[Dict[str, Any]]:
+        raise RuntimeError('providers.fetch_provider_records not available')
 
 
-def build_record_key(record: Dict[str, Any]) -> str:
-    name = (record.get("name") or "").strip().lower()
-    lat = record.get("latitude")
-    lng = record.get("longitude")
-    if lat is None or lng is None:
-        return name
-    return f"{name}|{round(float(lat), 6)}|{round(float(lng), 6)}"
-
-
-def dedupe_records(records: List[Dict[str, Any]], existing_keys: Optional[set] = None) -> List[Dict[str, Any]]:
-    existing_keys = existing_keys or set()
-    deduped: List[Dict[str, Any]] = []
-    seen = set(existing_keys)
-    for record in records:
-        key = build_record_key(record)
-        if key and key not in seen:
-            seen.add(key)
-            deduped.append(record)
-    return deduped
 
 
 def load_existing_keys(results_dir: str) -> set:
@@ -584,74 +393,7 @@ def load_existing_keys(results_dir: str) -> set:
     return keys
 
 
-def save_to_csv(records: List[Dict[str, Any]], path: str) -> str:
-    filepath = Path(path)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with filepath.open("w", encoding="utf-8-sig", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=DEFAULT_FIELDS)
-        writer.writeheader()
-        for record in records:
-            writer.writerow({field: record.get(field, "") for field in DEFAULT_FIELDS})
-    return str(filepath)
-
-
-def save_to_json(records: List[Dict[str, Any]], path: str) -> str:
-    filepath = Path(path)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with filepath.open("w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
-    return str(filepath)
-
-
-def save_to_excel(records: List[Dict[str, Any]], path: str) -> str:
-    if openpyxl is None:
-        raise ImportError("Excel 导出需要 openpyxl，可通过 pip install openpyxl 安装。")
-    filepath = Path(path)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.append(DEFAULT_FIELDS)
-    for record in records:
-        sheet.append([record.get(field, "") for field in DEFAULT_FIELDS])
-    workbook.save(filepath)
-    return str(filepath)
-
-
-def append_log(log_path: str, entry: Dict[str, Any]) -> None:
-    filepath = Path(log_path)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with filepath.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
-def load_logs(log_path: str) -> List[Dict[str, Any]]:
-    logs: List[Dict[str, Any]] = []
-    path = Path(log_path)
-    if not path.exists():
-        return logs
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                logs.append(json.loads(line.strip()))
-            except Exception:
-                continue
-    return logs
-
-
-def export_logs(logs: List[Dict[str, Any]], export_path: str) -> str:
-    path = Path(export_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.suffix.lower() == ".csv":
-        fields = ["task_name", "run_time", "area", "status", "records", "mode", "message"]
-        with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            for log_entry in logs:
-                writer.writerow({k: log_entry.get(k, "") for k in fields})
-    else:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(logs, f, ensure_ascii=False, indent=2)
-    return str(path)
+# utility functions moved to poi_utils.py
 
 
 def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual") -> Dict[str, Any]:
@@ -907,6 +649,8 @@ def create_gui(config_path: str) -> None:
     schedule_interval_var = tk.StringVar(value=str(current_config["value"].get("schedule_interval_days", 1)))
     # single export format (global)
     export_format_var = tk.StringVar(value=str(current_config["value"].get("export_format", (current_config["value"].get("export_formats", ["csv"])[0]))))
+    # concurrency (thread pool size)
+    concurrency_var = tk.StringVar(value=str(current_config["value"].get("max_concurrency", 1)))
 
     def get_country_choices() -> List[str]:
         return ["中华人民共和国"]
@@ -990,13 +734,18 @@ def create_gui(config_path: str) -> None:
         except Exception as exc:
             messagebox.showerror("错误", f"加载配置失败：{exc}")
 
+    # create executor for Tkinter GUI
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(current_config["value"].get("max_concurrency", 1)))
+
     def save_current_config() -> None:
+        nonlocal executor
         try:
             # 更新 global 设置到 current_config
             try:
                 current_config["value"]["provider"] = providers_var.get().strip()
                 current_config["value"]["resources"] = [r.strip() for r in resources_var.get().split(",") if r.strip()]
                 current_config["value"]["export_format"] = export_format_var.get().strip()
+                current_config["value"]["max_concurrency"] = int(concurrency_var.get() or current_config["value"].get("max_concurrency", 1))
                 # keep legacy export_formats list untouched
                 current_config["value"]["default_page_limit"] = int(page_limit_var.get() or current_config["value"].get("default_page_limit", 3))
                 current_config["value"]["incremental"] = bool(incremental_var.get())
@@ -1004,6 +753,18 @@ def create_gui(config_path: str) -> None:
             except Exception:
                 pass
             save_json(config_var.get(), current_config["value"])
+            # recreate executor if concurrency changed
+            try:
+                new_max = int(current_config["value"].get("max_concurrency", 1))
+                # if changed, shutdown and recreate
+                if getattr(executor, "_max_workers", None) != new_max:
+                    try:
+                        executor.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=new_max)
+            except Exception:
+                pass
             append_log(f"已保存配置：{config_var.get()}")
         except Exception as exc:
             messagebox.showerror("错误", f"保存配置失败：{exc}")
@@ -1138,13 +899,29 @@ def create_gui(config_path: str) -> None:
             return
         index = selection[0]
         task = current_config["value"].get("tasks", [])[index]
-        result = run_task(task, current_config["value"], mode="manual")
-        append_log(json.dumps(result, ensure_ascii=False))
+        def worker():
+            try:
+                res = run_task(task, current_config["value"], mode="manual")
+                root.after(0, lambda: append_log(json.dumps(res, ensure_ascii=False)))
+            except Exception as e:
+                root.after(0, lambda: append_log(f"任务运行失败: {e}"))
+        try:
+            executor.submit(worker)
+        except Exception:
+            threading.Thread(target=worker, daemon=True).start()
 
     def run_all_tasks() -> None:
-        results = run_tasks(current_config["value"].get("tasks", []), current_config["value"], mode="manual")
-        for entry in results:
-            append_log(json.dumps(entry, ensure_ascii=False))
+        def worker_all():
+            try:
+                results = run_tasks(current_config["value"].get("tasks", []), current_config["value"], mode="manual")
+                for entry in results:
+                    root.after(0, lambda e=entry: append_log(json.dumps(e, ensure_ascii=False)))
+            except Exception as e:
+                root.after(0, lambda: append_log(f"批量运行失败: {e}"))
+        try:
+            executor.submit(worker_all)
+        except Exception:
+            threading.Thread(target=worker_all, daemon=True).start()
 
     def load_log_entries() -> None:
         logs = load_logs(current_config["value"].get("logs_path", "logs/poi_fetcher_logs.jsonl"))
@@ -1255,6 +1032,10 @@ def create_gui(config_path: str) -> None:
     export_combobox = ttk.Combobox(editor_frame, textvariable=export_format_var, values=["csv", "json", "excel"], width=12, state="readonly")
     export_combobox.grid(row=row, column=1, sticky="w")
     row += 1
+    # 并发数（线程池大小）
+    ttk.Label(editor_frame, text="并发数：").grid(row=row, column=0, sticky="w")
+    ttk.Entry(editor_frame, textvariable=concurrency_var, width=12).grid(row=row, column=1, sticky="w")
+    row += 1
     ttk.Label(editor_frame, text="分页限制：").grid(row=row, column=0, sticky="w")
     ttk.Entry(editor_frame, textvariable=page_limit_var, width=12).grid(row=row, column=1, sticky="w")
     row += 1
@@ -1274,9 +1055,19 @@ def create_gui(config_path: str) -> None:
     root.mainloop()
 
 
+def create_gui_pyqt(config_path: str) -> None:
+    # delegate to extracted gui_pyqt module (lazy import to avoid circular imports)
+    try:
+        from gui_pyqt import create_gui_pyqt as _create_gui_pyqt
+
+        return _create_gui_pyqt(config_path)
+    except Exception as exc:
+        print(f"无法启动 PyQt GUI: {exc}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="保障资源 POI 抓取与调度工具")
-    parser.add_argument("--config", default="poi_config.json", help="配置文件路径")
+    parser.add_argument("--config", default="config/poi_config.json", help="配置文件路径")
     parser.add_argument("--init-config", action="store_true", help="初始化默认配置文件")
     parser.add_argument("--list-tasks", action="store_true", help="列出当前配置中的任务")
     parser.add_argument("--run-all", action="store_true", help="执行全部任务")
@@ -1314,7 +1105,7 @@ def main() -> None:
         args.gui,
     ])
     if no_cli_flags:
-        create_gui(args.config)
+        create_gui_pyqt(args.config)
         return
 
     config = load_config(args.config)
@@ -1371,7 +1162,7 @@ def main() -> None:
         if not args.gui and not args.run_scheduled:
             return
     if args.gui:
-        create_gui(args.config)
+        create_gui_pyqt(args.config)
         return
     if args.allow_auto_start:
         if config.get("scheduler", {}).get("enabled", True):

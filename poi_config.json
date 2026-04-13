@@ -5,19 +5,10 @@
     "tencent": "YOUR_TENCENT_API_KEY"
   },
   "keywords": {
-    "gas_station": [
-      "加油站"
-    ],
-    "service_area": [
-      "服务区"
-    ],
-    "hospital": [
-      "医院"
-    ],
-    "repair_factory": [
-      "维修工厂",
-      "汽车修理厂"
-    ]
+    "gas_station": ["加油站"],
+    "service_area": ["服务区"],
+    "hospital": ["医院"],
+    "repair_factory": ["维修工厂", "汽车修理厂"]
   },
   "tasks": [
     {
@@ -30,12 +21,8 @@
         "county": ""
       },
       "radius": 10000,
-      "providers": [
-        "baidu"
-      ],
-      "resources": [
-        "gas_station"
-      ],
+      "providers": ["baidu"],
+      "resources": ["gas_station"],
       "incremental": true,
       "page_limit": 3,
       "schedule": {
@@ -46,25 +33,21 @@
     {
       "name": "唐山_服务区_bbox",
       "enabled": false,
-      "area_type": "admin",
-      "providers": [
-        "baidu"
-      ],
-      "resources": [
-        "service_area"
-      ],
+      "area_type": "bbox",
+      "bbox": {
+        "left": 118.0,
+        "bottom": 39.4,
+        "right": 118.5,
+        "top": 39.8
+      },
+      "providers": ["gaode"],
+      "resources": ["service_area"],
       "incremental": true,
       "page_limit": 3,
       "schedule": {
         "type": "daily",
         "interval_days": 7
-      },
-      "admin_region": {
-        "country": "中华人民共和国",
-        "province": "河北省",
-        "city": "唐山市"
-      },
-      "bbox": null
+      }
     }
   ],
   "auto_start": false,
@@ -74,10 +57,6 @@
   },
   "results_dir": "results",
   "logs_path": "logs/poi_fetcher_logs.jsonl",
-  "export_formats": [
-    "csv",
-    "json",
-    "excel"
-  ],
+  "export_formats": ["csv", "json", "excel"],
   "default_page_limit": 3
 }
