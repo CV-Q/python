@@ -54,26 +54,25 @@ python map_poi_fetcher.py --help
 
 作者/维护：项目重构由团队进行，变更已提交到本地 git 仓库。
 
-最新提交记录：
+更新记录（按时间倒序，最近重要提交）：
 
-- 提交哈希：`9749040`（短哈希）
-- 提交说明：feat: add '全部' UI options; expand province->cities with configurable concurrency/rate-limit; expose in GUI and README
-- 提交时间：2026-04-13
+- `0bcc5b6` (2026-04-13) — docs: add brief summary of recent updates
+	- 在 README 中添加本次更新的简要摘要，归纳 GUI 与后端改动要点。
 
-- 新提交哈希：`8ef4265`（短哈希）
-- 提交说明：chore(gui): expose scheduler.check_interval_minutes, localize provider names, resource example, and fix global save button
-- 提交时间：2026-04-13
+- `8ef4265` (2026-04-13) — chore(gui): expose scheduler.check_interval_minutes; localize provider names; resource example; fix global save button
+	- 在 GUI 中暴露 `scheduler.check_interval_minutes`（调度检查间隔，单位：分钟）。
+	- 将“提供商”下拉本地化为中文显示（百度/高德/腾讯），保存时映射为内部键。
+	- 将 `资源` 示例改为英文 JSON（如 `["gas_station","service_area","hospital"]`），并支持粘贴 JSON 列表或以中/英文逗号分隔的关键词；保存时智能解析并写入配置。
+	- 修复并绑定“保存全局设置”按钮，确保在全局设置页点击后能正确写入配置文件。
 
-（如果需要精确回退或查看变更，请在仓库中使用 `git log` 或 `git show 9749040`。）
+- `9749040` (2026-04-13) — feat: add '全部' UI options; expand province->cities with configurable concurrency/rate-limit
+	- 在城市与区县下拉中加入“全部”选项；当任务城市字段为空（表示“全部”）时，`run_task` 会展开为对该省下所有城市逐市抓取并合并去重结果，提升省级抓取完整性。
+	- 新增并发/速率控制配置：`province_expand_concurrency` 与 `province_expand_delay_seconds`，可在 GUI 中调整以避免触发第三方 API 限流。
+	- 单市抓取失败会记录为子任务失败日志，但不会中断整个省级任务，便于重试与故障排查。
 
-更新内容（最近提交 9749040）：
+完整历史请使用 `git log --oneline` 或 `git show <commit>` 查看详细条目。
 
-- 新增界面选项：在城市和区/县下拉中加入“全部”选项，用户可选择抓取整个市或整省（在界面上选择“全部”后保存为特殊值并在任务运行时展开）。
-- 任务行为改进：当任务为行政区且城市字段保存为空（表示界面选择“全部”）时，`run_task` 会自动展开为对该省下所有城市逐个查询，并合并去重结果，避免单次省级查询遗漏数据。
-- 并发与速率控制：新增配置项 `province_expand_concurrency`（并发数）和 `province_expand_delay_seconds`（请求间隔秒数），并在 GUI 的“全局设置”中提供对应控件，默认分别为 4 和 0.5s，用于在省级展开时限制并发与平滑请求速率，降低触发第三方 API 限流的风险。
-- GUI 与配置：`gui_pyqt.py` 已暴露上述新设置，保存配置时会写入 `config/poi_config.json`；界面中“提供商/资源”等国际化文本已调整为中文显示。
-- 日志与容错：对省内各市的单次抓取失败记录为子任务失败日志，但不会中断整个省级任务，便于部分重试与故障排查。
-- 测试与示例：新增轻量测试脚本 `tests/test_all_option.py` 用于验证“全部”选项和省级展开行为；新增 `config/region_cache.json` 与测试配置示例 `config/test_poi_config.json`。
+注意：省级展开会大量增加对第三方地图服务的请求量，请在生产环境使用前配置合适的并发与延迟并先在小规模上进行试验。
 - 归档与回退：保留了原 Tk 界面与早期 PyQt 实现的备份文件在 `archive/` 目录，便于回退与对比。
 
 注意：省级展开会大量增加对第三方地图服务的请求量，请在生产环境使用前配置合适的并发与延迟并先在小规模上进行试验。
