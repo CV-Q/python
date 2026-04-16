@@ -487,7 +487,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
             print(f"[DEBUG] fetch_with_delay provider={provider_arg} admin_region={admin_region_arg} keyword={keyword_arg} resource={resource_type_arg}")
         except Exception:
             pass
-        return fetch_provider_records(
+        res = fetch_provider_records(
             provider_arg,
             api_keys_arg,
             keyword_arg,
@@ -500,6 +500,27 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
             progress_callback=progress_callback,
             stop_event=stop_event,
         )
+        # If provider-specific config does not exist, generate a minimal provider config after successful first response
+        try:
+            if res:
+                prov_path = config_loader.provider_config_path(provider_arg, "config/poi_config.json")
+                from pathlib import Path as _P
+                if provider_arg not in created_provider_configs and not _P(prov_path).exists():
+                    minimal = {
+                        "api_keys": {provider_arg: api_keys.get(provider_arg, "")},
+                        "resources": config.get("resources", []),
+                        "keywords": config.get("keywords", {}),
+                        "provider": provider_arg,
+                    }
+                    try:
+                        config_loader.save_provider_config(provider_arg, minimal, "config/poi_config.json")
+                        created_provider_configs.add(provider_arg)
+                        append_log(config.get("logs_path"), make_log_entry(task_name, run_time, normalize_area(str(admin_region_arg)), "info", records=0, provider=PROVIDER_DISPLAY.get(provider_arg, provider_arg), message=f"已生成 provider 配置: {prov_path}"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return res
 
     def bbox_from_polyline(polyline: str) -> Optional[Dict[str, float]]:
         try:
@@ -531,6 +552,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
         return out
 
     api_keys = config.get("api_keys", {})
+    created_provider_configs = set()
 
     for resource in resources:
         keywords = list(dict.fromkeys(build_keywords_for_resource(resource)))
