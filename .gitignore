@@ -1,0 +1,11 @@
+# Ignore sensitive config and runtime/build artifacts
+config/poi_config.json
+POI_Data/
+logs/
+build/
+bin/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
