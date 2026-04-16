@@ -26,7 +26,12 @@ from poi_utils import (
     normalize_record,
     merge_keywords,
     get_city_center,
+    append_new_records,
+    make_log_entry,
+    format_time,
+    normalize_area,
 )
+import config_loader
 from providers import fetch_provider_records
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -57,7 +62,7 @@ except Exception:
     pass
 
 # --- Constants ---
-SUPPORTED_PROVIDERS = ["baidu", "gaode", "tencent"]
+SUPPORTED_PROVIDERS = ["baidu", "gaode", "tianditu"]
 RESOURCE_TYPES = ["gas_station", "service_area", "hospital", "repair_factory"]
 DEFAULT_KEYWORDS = {
     "gas_station": ["加油站"],
@@ -69,6 +74,9 @@ AMAP_TYPE_MAP = {
     "hospital": "120000",
     "gas_station": "050700",
 }
+
+# Provider display names for logs/UI
+PROVIDER_DISPLAY = {"baidu": "百度", "gaode": "高德", "tianditu": "天地图"}
 DEFAULT_FIELDS = [
     "source",
     "id",
@@ -111,7 +119,7 @@ CITY_COORDINATES = {
 }
 
 DEFAULT_CONFIG = {
-    "api_keys": {"baidu": "", "gaode": "", "tencent": ""},
+    "api_keys": {"baidu": "", "gaode": "", "tianditu": ""},
     "keywords": DEFAULT_KEYWORDS,
     "tasks": [],
     "auto_start": False,
@@ -156,119 +164,105 @@ def save_json(path: str, data: Any) -> None:
 
 def create_default_config(path: str) -> Dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
-    config["api_keys"] = config["api_keys"].copy()
-    config["keywords"] = {k: v.copy() for k, v in DEFAULT_KEYWORDS.items()}
-    save_json(path, config)
+    ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
     return config
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    config = load_json(path)
-    if config is None:
-        config = create_default_config(path)
-    if "keywords" not in config:
-        config["keywords"] = {k: v.copy() for k, v in DEFAULT_KEYWORDS.items()}
-    if "tasks" not in config:
-        config["tasks"] = []
-    if "api_keys" not in config:
-        config["api_keys"] = {"baidu": "", "gaode": "", "tencent": ""}
-    if "results_dir" not in config:
-        config["results_dir"] = "results"
-    if "logs_path" not in config:
-        config["logs_path"] = "logs/poi_fetcher_logs.jsonl"
-    if "export_formats" not in config:
-        config["export_formats"] = ["csv", "json", "excel"]
-    if "default_page_limit" not in config:
-        config["default_page_limit"] = 3
-    if "scheduler" not in config:
-        config["scheduler"] = {"enabled": True, "check_interval_minutes": 15}
-    return config
+def load_config_file(path: str) -> Dict[str, Any]:
+    try:
+        return load_config(path)
+    except Exception:
+        return create_default_config(path)
 
 
 def get_region_cache_path(config_path: str) -> str:
-    return str(Path(config_path).with_name("region_cache.json"))
+    p = Path(config_path)
+    cache_dir = p.parent if p.parent.exists() else Path("config")
+    return str(cache_dir / "region_cache.json")
 
 
 def load_region_cache(path: str) -> Dict[str, Any]:
-    data = load_json(path)
-    return data if isinstance(data, dict) else {}
+    try:
+        if Path(path).exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return {}
+    return {}
 
 
-def save_region_cache(path: str, data: Dict[str, Any]) -> None:
-    ensure_parent_dir(path)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_region_cache(path: str, data: Any) -> None:
+    try:
+        ensure_parent_dir(path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
-def fetch_amap_region_hierarchy(key: str) -> Dict[str, Dict[str, List[str]]]:
-    if not key:
-        raise ValueError("高德 API Key 未配置，无法获取行政区数据。")
-    params = {
-        "key": key,
-        "keywords": "中国",
-        "subdistrict": 3,
-        "extensions": "base",
-        "output": "json",
-    }
-    resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != "1":
-        raise RuntimeError(f"高德行政区数据接口返回错误: {data}")
-    result: Dict[str, Dict[str, List[str]]] = {}
-    provinces = data.get("districts", [])
-    for province in provinces:
-        province_name = province.get("name", "")
-        if not province_name:
-            continue
-        result[province_name] = {}
-        for city in province.get("districts", []):
-            city_name = city.get("name", "")
-            if not city_name:
-                continue
-            counties = [district.get("name", "") for district in city.get("districts", []) if district.get("name")]
-            result[province_name][city_name] = counties
-    return result
-
-
-def fetch_amap_subdistrict(key: str, province: str, city: str) -> List[str]:
-    """Fetch county/district list for a given province+city from Amap (subdistrict=1).
-
-    Returns a list of county names (may be empty).
+def fetch_amap_subdistrict(gaode_key: str, province: str, city: str) -> List[str]:
+    """Fetch subdistrict (counties) of a given city from AMap (高德).
+    Returns list of dicts: {"name": <name>, "adcode": <adcode>, "polyline": <polyline or empty>}.
+    Falls back to list of names for backward compatibility.
     """
-    if not key:
+    if not gaode_key:
         return []
-    params = {
-        "key": key,
-        "keywords": city,
-        "subdistrict": 1,
-        "extensions": "base",
-        "output": "json",
-    }
-    resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != "1":
+    try:
+        params = {"key": gaode_key, "keywords": city or province, "subdistrict": 1, "extensions": "base"}
+        resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "1":
+            return []
+        districts = data.get("districts", [])
+        if not districts:
+            return []
+        # navigate into subdistricts
+        first = districts[0]
+        sub = first.get("districts", [])
+        out = []
+        for d in sub:
+            if not d:
+                continue
+            name = d.get("name") or ""
+            adcode = d.get("adcode") or d.get("citycode") or ""
+            polyline = d.get("polyline") or ""
+            if name:
+                out.append({"name": name, "adcode": adcode, "polyline": polyline})
+        return out
+    except Exception:
         return []
-    # data['districts'] may contain multiple provinces; try to find matching province
-    for prov in data.get("districts", []):
-        prov_name = prov.get("name", "")
-        # match by provided province or accept if only one province returned
-        if prov_name and (prov_name == province or len(data.get("districts", [])) == 1):
-            # If the returned top-level item is the city itself (common when searching by city name),
-            # then its child districts are the counties we want.
-            if prov_name == city:
-                return [d.get("name") for d in prov.get("districts", []) if d.get("name")]
-            for cit in prov.get("districts", []):
-                if cit.get("name") == city:
-                    return [d.get("name") for d in cit.get("districts", []) if d.get("name")]
-    # fallback: try first district's child that matches city
-    for prov in data.get("districts", []):
-        for cit in prov.get("districts", []):
-            if cit.get("name") == city:
-                return [d.get("name") for d in cit.get("districts", []) if d.get("name")]
-    return []
 
+
+def fetch_amap_region_hierarchy(api_key: str) -> Dict[str, Any]:
+    """Attempt to fetch a two-level region hierarchy from AMap."""
+    if not api_key:
+        return {}
+    try:
+        params = {"key": api_key, "keywords": "中国", "subdistrict": 2, "extensions": "base"}
+        resp = requests.get("https://restapi.amap.com/v3/config/district", params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "1":
+            return {}
+        districts = data.get("districts", [])
+        if not districts:
+            return {}
+        # first element should be the country -> provinces
+        country = districts[0]
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for prov in country.get("districts", []):
+            prov_name = prov.get("name", "")
+            out[prov_name] = {}
+            for city in prov.get("districts", []):
+                city_name = city.get("name", "")
+                counties = [c.get("name", "") for c in city.get("districts", []) if c.get("name")]
+                out[prov_name][city_name] = counties
+        return out
+    except Exception:
+        return {}
 
 def ensure_region_data(config_path: str, api_key: str) -> Dict[str, Dict[str, List[str]]]:
     cache_path = get_region_cache_path(config_path)
@@ -330,7 +324,7 @@ def build_area_description(task: Dict[str, Any]) -> str:
         bbox = task.get("bbox", {})
         return f"bbox({bbox.get('left')},{bbox.get('top')},{bbox.get('right')},{bbox.get('bottom')})"
     admin = task.get("admin_region", {})
-    return f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}".strip()
+    return normalize_area(f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}")
 
 
 def task_target_values(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -345,7 +339,7 @@ def get_task_area_summary(task: Dict[str, Any]) -> str:
         bbox = task.get("bbox", {})
         return f"BBox {bbox.get('left')} , {bbox.get('bottom')} -> {bbox.get('right')} , {bbox.get('top')}"
     admin = task.get("admin_region", {})
-    return f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}"
+    return normalize_area(f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}")
 
 
 def format_time(dt: Optional[datetime]) -> str:
@@ -368,8 +362,9 @@ try:
     fetch_provider_records  # type: ignore
 except Exception:
     # fallback: simple lookup to avoid NameError during refactor
-    def fetch_provider_records(provider: str, api_keys: Dict[str, str], keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int) -> List[Dict[str, Any]]:
+    def fetch_provider_records(provider: str, api_keys: Dict[str, str], keyword: str, place_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int, progress_callback=None, stop_event=None) -> List[Dict[str, Any]]:
         raise RuntimeError('providers.fetch_provider_records not available')
+
 
 
 
@@ -399,12 +394,25 @@ def load_existing_keys(results_dir: str) -> set:
 # utility functions moved to poi_utils.py
 
 
-def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual") -> Dict[str, Any]:
+def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual", progress_callback=None, stop_event=None) -> Dict[str, Any]:
     run_time = format_time(datetime.now())
     task_name = task.get("name", task.get("task_name", "unnamed_task"))
     area = get_task_area_summary(task)
     page_limit = int(config.get("default_page_limit", 3))
-    # providers and resources are global settings now (in config)
+
+    # prepare incremental output path and existing keys set for incremental writes
+    base_dir = Path(config.get("results_dir", "POI_Data"))
+    date_folder = datetime.now().strftime("%Y-%m-%d")
+    result_dir = base_dir / date_folder
+    incremental_path = result_dir / f"{task_name}_incremental.csv"
+    existing_keys = set()
+    if config.get("incremental", True):
+        try:
+            existing_keys = load_existing_keys(config.get("results_dir", "POI_Data"))
+        except Exception:
+            existing_keys = set()
+
+    # determine providers
     prov = config.get("provider")
     if isinstance(config.get("providers"), list) and config.get("providers"):
         providers = config.get("providers")
@@ -412,142 +420,497 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual")
         providers = [prov]
     else:
         providers = SUPPORTED_PROVIDERS
+
     if task.get("area_type") == "admin" and not task.get("admin_region"):
         raise ValueError("行政区域任务必须包含 admin_region 配置。")
     if task.get("area_type") == "bbox" and not task.get("bbox"):
         raise ValueError("BBox 任务必须包含 bbox 配置。")
-    target = task_target_values(task)
-    keywords = []
-    for resource in config.get("resources", []):
-        # If resource refers to a known resource key (like 'gas_station') or is present in
-        # config['keywords'], use merge_keywords to expand to provider-specific keywords.
+
+    # resources: iterate one resource at a time to ensure single-resource-per-request
+    resources = config.get("resources", [])
+    if not isinstance(resources, list):
+        resources = [resources]
+
+    def build_keywords_for_resource(resource_item):
         try:
-            if isinstance(resource, str) and (resource in config.get("keywords", {}) or resource in RESOURCE_TYPES):
-                keywords.extend(merge_keywords(config, resource))
+            if isinstance(resource_item, str) and (resource_item in config.get("keywords", {}) or resource_item in RESOURCE_TYPES):
+                return merge_keywords(config, resource_item)
             else:
-                # treat value as literal keyword(s), allow comma or Chinese comma separation
-                parts = [p.strip() for p in re.split(r"[,，]", str(resource)) if p.strip()]
-                keywords.extend(parts)
+                return [p.strip() for p in re.split(r"[,，]", str(resource_item)) if p.strip()]
         except Exception:
-            # fallback: treat as raw text
-            try:
-                parts = [p.strip() for p in re.split(r"[,，]", str(resource)) if p.strip()]
-                keywords.extend(parts)
-            except Exception:
-                continue
-    # deduplicate while preserving order
-    keywords = list(dict.fromkeys(keywords))
+            return [p.strip() for p in re.split(r"[,，]", str(resource_item)) if p.strip()]
+
     records: List[Dict[str, Any]] = []
-    for keyword in keywords:
-        for provider in providers:
-            # If admin task and city is empty (UI '全部' selected at city level), expand to all cities in province
-            if task.get("area_type") == "admin":
-                admin = task.get("admin_region", {})
-                prov = admin.get("province", "")
-                cit = admin.get("city", None)
-                # treat None as not set; empty-string indicates UI '全部'
+
+    def emit_progress_lines(title: str = None, line1: str = None, line2: str = None):
+        """向 progress_callback 发送三行摘要（为可读性而非原始 JSON）：
+        - title: 任务头，格式：TaskName - 区域 - 资源 - 提供商
+        - line1: 子任务第一行，格式：区域-资源名
+        - line2: 子任务第二行，显示执行结果或错误/数量
+        发送类型分别为 summary_title/summary_query/summary_status，UI 端可按行处理显示。
+        """
+        if not progress_callback:
+            return
+        try:
+            if title is not None:
+                progress_callback({"type": "summary_title", "message": title})
+            if line1 is not None:
+                progress_callback({"type": "summary_query", "message": line1})
+            if line2 is not None:
+                progress_callback({"type": "summary_status", "message": line2})
+        except Exception:
+            pass
+
+    # rate limiting
+    rate_lock = threading.Lock()
+    last_call = {"t": 0.0}
+    global_delay = float(config.get("province_expand_delay_seconds", 0.0))
+
+    import rate_limiter
+
+    def fetch_with_delay(provider_arg, api_keys_arg, keyword_arg, resource_type_arg, latitude_arg, longitude_arg, bbox_arg, admin_region_arg, page_limit_arg, stop_event=None):
+        # global minimal delay between requests (keeps province expansion gentle)
+        with rate_lock:
+            now = time.time()
+            wait = max(0.0, global_delay - (now - last_call["t"]))
+            if wait > 0:
+                time.sleep(wait)
+            last_call["t"] = time.time()
+        # per-provider rate limiter (token-bucket, default 1 qps)
+        try:
+            rate_limiter.acquire(provider_arg)
+        except Exception:
+            # if limiter fails, fall back to a conservative sleep
+            time.sleep(max(1.0, global_delay))
+        # debug: show what admin_region is being passed
+        try:
+            print(f"[DEBUG] fetch_with_delay provider={provider_arg} admin_region={admin_region_arg} keyword={keyword_arg} resource={resource_type_arg}")
+        except Exception:
+            pass
+        return fetch_provider_records(
+            provider_arg,
+            api_keys_arg,
+            keyword_arg,
+            resource_type_arg,
+            latitude_arg,
+            longitude_arg,
+            bbox_arg,
+            admin_region_arg,
+            page_limit_arg,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+        )
+
+    def bbox_from_polyline(polyline: str) -> Optional[Dict[str, float]]:
+        try:
+            if not polyline:
+                return None
+            pts = [p.split(',') for p in polyline.split(';') if p]
+            lons = [float(p[0]) for p in pts if len(p) >= 2]
+            lats = [float(p[1]) for p in pts if len(p) >= 2]
+            if not lons or not lats:
+                return None
+            return {"left": min(lons), "right": max(lons), "bottom": min(lats), "top": max(lats)}
+        except Exception:
+            return None
+
+    def generate_grid(bbox: Dict[str, float], nx: int = 2, ny: int = 2) -> List[Dict[str, float]]:
+        out = []
+        if not bbox:
+            return out
+        left, right, bottom, top = bbox["left"], bbox["right"], bbox["bottom"], bbox["top"]
+        dx = (right - left) / max(1, nx)
+        dy = (top - bottom) / max(1, ny)
+        for i in range(nx):
+            for j in range(ny):
+                l = left + i * dx
+                r = left + (i + 1) * dx
+                b = bottom + j * dy
+                t = bottom + (j + 1) * dy
+                out.append({"left": l, "right": r, "bottom": b, "top": t})
+        return out
+
+    api_keys = config.get("api_keys", {})
+
+    for resource in resources:
+        keywords = list(dict.fromkeys(build_keywords_for_resource(resource)))
+        for keyword in keywords:
+            for provider in providers:
+                if task.get("area_type") == "admin":
+                    admin = task.get("admin_region", {})
+                    prov_name = admin.get("province", "")
+                    cit = admin.get("city", None)
+                    cnty = admin.get("county", None)
+
+                # province-level expand: iterate cities
                 if cit == "":
-                    # try to load region cache from common location
                     try:
-                        cache = load_region_cache("config/region_cache.json")
+                        cache = load_region_cache(get_region_cache_path("config/poi_config.json"))
                     except Exception:
                         cache = {}
-                    cities_list = []
-                    if isinstance(cache, dict) and prov in cache:
-                        val = cache[prov]
+                    cities_list: List[str] = []
+                    if isinstance(cache, dict) and prov_name in cache:
+                        val = cache[prov_name]
                         if isinstance(val, list):
                             cities_list = [str(x) for x in val]
                         elif isinstance(val, dict):
                             cities_list = list(val.keys())
-                    if not cities_list and prov in REGION_DATA:
-                        cities_list = list(REGION_DATA.get(prov, []))
-                    # if still empty, fall back to a single empty city to preserve prior behavior
+                    if not cities_list and prov_name in REGION_DATA:
+                        cities_list = list(REGION_DATA.get(prov_name, []))
                     if not cities_list:
                         cities_list = [""]
 
-                    # Use a thread pool to fetch per-city, honoring configured concurrency and delay
-                    concurrency = int(config.get("province_expand_concurrency", config.get("max_concurrency", 1)))
-                    delay = float(config.get("province_expand_delay_seconds", 0.0))
-
-                    # global rate limiter state for spacing requests
-                    rate_lock = threading.Lock()
-                    last_call = {"t": 0.0}
-
-                    def call_fetch_for_city(city_name: str):
-                        # enforce minimal delay between requests (global)
-                        with rate_lock:
-                            now = time.time()
-                            wait = max(0.0, delay - (now - last_call["t"]))
-                            if wait > 0:
-                                time.sleep(wait)
-                            last_call["t"] = time.time()
+                    for city_name in cities_list:
+                        if progress_callback:
+                            try:
+                                progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": city_name, "level": "city", "provider": provider})
+                            except Exception:
+                                pass
+                            # 额外发送三行摘要：任务名 / 查询(关键词/资源/区域) / 执行状态
+                            emit_progress_lines(
+                                title=f"{task_name} - {prov_name}/{city_name} - {resource} - {provider}",
+                                line1=f"{prov_name}/{city_name} - {resource}",
+                                line2="开始",
+                            )
                         try:
-                            return fetch_provider_records(
+                            provider_records = fetch_with_delay(
                                 provider,
-                                config.get("api_keys", {}),
+                                api_keys,
                                 keyword,
-                                task.get("resource_type", ""),
+                                resource,
                                 None,
                                 None,
                                 None,
-                                {"province": prov, "city": city_name, "county": ""},
+                                {"province": prov_name, "city": city_name, "county": ""},
                                 page_limit,
+                                stop_event=stop_event,
                             )
                         except Exception as exc:
                             append_log(config["logs_path"], {
                                 "task_name": task_name,
                                 "run_time": run_time,
-                                "area": f"{prov} / {city_name} / ",
+                                "area": normalize_area(f"{prov_name} / {city_name} / "),
+                                "provider": PROVIDER_DISPLAY.get(provider, provider),
                                 "status": "failed",
                                 "records": 0,
                                 "mode": mode,
                                 "message": f"子区域抓取失败: {exc}",
                             })
-                            return []
+                            if progress_callback:
+                                try:
+                                    progress_callback({"type": "subtask_failed", "task_name": task_name, "province": prov_name, "city": city_name, "level": "city", "provider": provider, "message": str(exc)})
+                                except Exception:
+                                    pass
+                                emit_progress_lines(
+                                    title=f"{task_name} - {prov_name}/{city_name} - {resource} - {provider}",
+                                    line1=f"{prov_name}/{city_name} - {resource}",
+                                    line2=f"失败: {exc}",
+                                )
+                            provider_records = []
 
-                    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-                        futures = {pool.submit(call_fetch_for_city, c): c for c in cities_list}
-                        for fut in as_completed(futures):
-                            city_item = futures[fut]
+                        for item in provider_records:
+                            records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                        if progress_callback:
                             try:
-                                provider_records = fut.result()
-                            except Exception as exc:
-                                provider_records = []
-                            for item in provider_records:
-                                records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
-                    # finished expanding cities for this provider+keyword
+                                progress_callback({"type": "subtask_done", "task_name": task_name, "province": prov_name, "city": city_name, "level": "city", "provider": provider, "count": len(provider_records)})
+                            except Exception:
+                                pass
+                            emit_progress_lines(
+                                title=f"{task_name} - {prov_name}/{city_name} - {resource} - {provider}",
+                                line1=f"{prov_name}/{city_name} - {resource}",
+                                line2=f"成功, 数据数量: {len(provider_records)}",
+                            )
+                        # incremental append
+                        try:
+                            if config.get("incremental", True) and provider_records:
+                                new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in provider_records]
+                                appended = append_new_records(new_norm, str(incremental_path), existing_keys)
+                                append_log(config["logs_path"], make_log_entry(task_name, run_time, f"{prov_name} / {city_name}", "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                        except Exception:
+                            pass
                     continue
-            # default single-call behavior
-            try:
-                provider_records = fetch_provider_records(
-                    provider,
-                    config.get("api_keys", {}),
-                    keyword,
-                    task.get("resource_type", ""),
-                    target.get("latitude"),
-                    target.get("longitude"),
-                    target.get("bbox"),
-                    task.get("admin_region") if task.get("area_type") == "admin" else None,
-                    page_limit,
+
+                # city-level expand: iterate counties
+                if cit and cnty == "":
+                    try:
+                        cache = load_region_cache(get_region_cache_path("config/poi_config.json"))
+                    except Exception:
+                        cache = {}
+                    counties_list: List[str] = []
+                    if isinstance(cache, dict) and prov_name in cache:
+                        val = cache[prov_name]
+                        if isinstance(val, dict) and cit in val:
+                            counties_list = [str(x) for x in val.get(cit, [])]
+                    if not counties_list:
+                        gaode_key = api_keys.get("gaode", "")
+                        counties_list = fetch_amap_subdistrict(gaode_key, prov_name, cit)
+                    if not counties_list:
+                        counties_list = [""]
+
+                    for county_name in counties_list:
+                        # support counties_list items that may be dicts with adcode
+                        county_display = county_name.get("name") if isinstance(county_name, dict) else county_name
+                        county_adcode = county_name.get("adcode") if isinstance(county_name, dict) else ""
+                        if progress_callback:
+                            try:
+                                progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": cit, "county": county_display, "level": "county", "provider": provider})
+                            except Exception:
+                                pass
+                            emit_progress_lines(
+                                title=f"{task_name} - {prov_name}/{cit}/{county_display} - {resource} - {provider}",
+                                line1=f"{prov_name}/{cit}/{county_display} - {resource}",
+                                line2="开始",
+                            )
+                        try:
+                            admin_region_param = {"province": prov_name, "city": cit, "county": county_display}
+                            if county_adcode:
+                                # include adcode for provider to use precise county query
+                                admin_region_param["adcode"] = county_adcode
+                            provider_records = fetch_with_delay(
+                                provider,
+                                api_keys,
+                                keyword,
+                                resource,
+                                None,
+                                None,
+                                None,
+                                admin_region_param,
+                                page_limit,
+                                stop_event=stop_event,
+                            )
+                        except Exception as exc:
+                            append_log(config["logs_path"], {
+                                "task_name": task_name,
+                                "run_time": run_time,
+                                "area": normalize_area(f"{prov_name} / {cit} / {county_display}"),
+                                "provider": PROVIDER_DISPLAY.get(provider, provider),
+                                "status": "failed",
+                                "records": 0,
+                                "mode": mode,
+                                "message": f"子区域抓取失败: {exc}",
+                            })
+                            if progress_callback:
+                                try:
+                                    progress_callback({"type": "subtask_failed", "task_name": task_name, "province": prov_name, "city": cit, "county": county_name, "level": "county", "provider": provider, "message": str(exc)})
+                                except Exception:
+                                    pass
+                                emit_progress_lines(
+                                    title=f"{task_name} - {prov_name}/{cit}/{county_name} - {resource} - {provider}",
+                                    line1=f"{prov_name}/{cit}/{county_name} - {resource}",
+                                    line2=f"失败: {exc}",
+                                )
+                            provider_records = []
+
+                        for item in provider_records:
+                            records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                        if progress_callback:
+                            try:
+                                progress_callback({"type": "subtask_done", "task_name": task_name, "province": prov_name, "city": cit, "county": county_name, "level": "county", "provider": provider, "count": len(provider_records)})
+                            except Exception:
+                                pass
+                            emit_progress_lines(
+                                title=f"{task_name} - {prov_name}/{cit}/{county_name} - {resource} - {provider}",
+                                line1=f"{prov_name}/{cit}/{county_name} - {resource}",
+                                line2=f"成功, 数据数量: {len(provider_records)}",
+                            )
+                        # incremental append for county
+                        try:
+                            if config.get("incremental", True) and provider_records:
+                                new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in provider_records]
+                                appended = append_new_records(new_norm, str(incremental_path), existing_keys)
+                                append_log(config["logs_path"], make_log_entry(task_name, run_time, f"{prov_name} / {cit} / {county_display}", "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                        except Exception:
+                            pass
+
+                        # If provider returned results hitting the page_limit * page_size threshold,
+                        # consider the area under-sampled and attempt grid refinement using the
+                        # county polyline (if available).
+                        try:
+                            page_size = 20
+                            max_expected = int(page_limit) * page_size
+                            if len(provider_records) >= max_expected:
+                                # only attempt refinement when we have polyline info
+                                if isinstance(county_name, dict) and county_name.get("polyline"):
+                                    bbox = bbox_from_polyline(county_name.get("polyline"))
+                                    if bbox:
+                                        grids = generate_grid(bbox, nx=2, ny=2)
+                                        for idx, cell in enumerate(grids):
+                                            if progress_callback:
+                                                try:
+                                                    progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": cit, "county": county_display, "level": "grid", "provider": provider, "grid_index": idx})
+                                                except Exception:
+                                                    pass
+                                                emit_progress_lines(
+                                                    title=f"{task_name} - {prov_name}/{cit}/{county_display} [grid {idx}] - {resource} - {provider}",
+                                                    line1=f"{prov_name}/{cit}/{county_display} [grid {idx}] - {resource}",
+                                                    line2=f"开始 网格 {idx}",
+                                                )
+                                            try:
+                                                cell_records = fetch_with_delay(
+                                                    provider,
+                                                    api_keys,
+                                                    keyword,
+                                                    resource,
+                                                    None,
+                                                    None,
+                                                    cell,
+                                                    None,
+                                                    page_limit,
+                                                    stop_event=stop_event,
+                                                )
+                                            except Exception as exc:
+                                                cell_records = []
+                                            for item in cell_records:
+                                                records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                                            if progress_callback:
+                                                try:
+                                                    progress_callback({"type": "subtask_done", "task_name": task_name, "province": prov_name, "city": cit, "county": county_display, "level": "grid", "provider": provider, "grid_index": idx, "count": len(cell_records)})
+                                                except Exception:
+                                                    pass
+                                                emit_progress_lines(
+                                                    title=f"{task_name} - {prov_name}/{cit}/{county_display} [grid {idx}] - {resource} - {provider}",
+                                                    line1=f"{prov_name}/{cit}/{county_display} [grid {idx}] - {resource}",
+                                                    line2=f"成功, 数据数量: {len(cell_records)} (网格 {idx})",
+                                                )
+                                            # incremental append for grid cell
+                                            try:
+                                                if config.get("incremental", True) and cell_records:
+                                                    new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in cell_records]
+                                                    appended = append_new_records(new_norm, str(incremental_path), existing_keys)
+                                                    append_log(config["logs_path"], make_log_entry(task_name, run_time, f"{prov_name} / {cit} / {county_display} [grid {idx}]", "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                                            except Exception:
+                                                pass
+                        except Exception:
+                            pass
+                    continue
+
+                # specific admin region -> single call
+                if progress_callback:
+                    try:
+                        progress_callback({"type": "start_subtask", "task_name": task_name, "area": normalize_area(area), "level": "single", "provider": provider})
+                    except Exception:
+                        pass
+                emit_progress_lines(
+                    title=f"{task_name} - {area} - {resource} - {provider}",
+                    line1=f"{area} - {resource}",
+                    line2="开始",
                 )
-            except Exception as exc:
-                entry = {
-                    "task_name": task_name,
-                    "run_time": run_time,
-                    "area": area,
-                    "status": "failed",
-                    "records": 0,
-                    "mode": mode,
-                    "message": str(exc),
-                }
-                append_log(config["logs_path"], entry)
-                return entry
-            for item in provider_records:
-                records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                try:
+                    provider_records = fetch_with_delay(
+                        provider,
+                        api_keys,
+                        keyword,
+                        resource,
+                        None,
+                        None,
+                        None,
+                        admin,
+                        page_limit,
+                        stop_event=stop_event,
+                    )
+                except Exception as exc:
+                        entry = {
+                            "task_name": task_name,
+                            "run_time": run_time,
+                            "area": area,
+                            "provider": PROVIDER_DISPLAY.get(provider, provider),
+                            "status": "failed",
+                            "records": 0,
+                            "mode": mode,
+                            "message": str(exc),
+                        }
+                        append_log(config["logs_path"], entry)
+                        if progress_callback:
+                            try:
+                                progress_callback({"type": "subtask_failed", "task_name": task_name, "area": area, "provider": provider, "message": str(exc)})
+                            except Exception:
+                                pass
+                        provider_records = []
+                for item in provider_records:
+                    records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                if progress_callback:
+                    try:
+                        progress_callback({"type": "subtask_done", "task_name": task_name, "area": area, "level": "single", "provider": provider, "count": len(provider_records)})
+                    except Exception:
+                        pass
+                # incremental append for bbox/point call
+                try:
+                    if config.get("incremental", True) and provider_records:
+                        new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in provider_records]
+                        appended = append_new_records(new_norm, str(incremental_path), existing_keys)
+                        append_log(config["logs_path"], make_log_entry(task_name, run_time, area, "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                except Exception:
+                    pass
+                # incremental append for single admin region
+                try:
+                    if config.get("incremental", True) and provider_records:
+                        new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in provider_records]
+                        appended = append_new_records(new_norm, str(incremental_path), existing_keys)
+                        append_log(config["logs_path"], make_log_entry(task_name, run_time, area, "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                except Exception:
+                    pass
+
+            if task.get("area_type") != "admin":
+                # bbox or point-based call
+                if progress_callback:
+                    try:
+                        progress_callback({"type": "start_subtask", "task_name": task_name, "area": area, "level": "single", "provider": provider})
+                    except Exception:
+                        pass
+                try:
+                    provider_records = fetch_with_delay(
+                        provider,
+                        api_keys,
+                        keyword,
+                        resource,
+                        task_target_values(task).get("latitude"),
+                        task_target_values(task).get("longitude"),
+                        task.get("bbox") if task.get("area_type") == "bbox" else None,
+                        None,
+                        page_limit,
+                        stop_event=stop_event,
+                    )
+                except Exception as exc:
+                    append_log(config["logs_path"], {
+                        "task_name": task_name,
+                        "run_time": run_time,
+                        "area": normalize_area(area),
+                        "provider": PROVIDER_DISPLAY.get(provider, provider),
+                        "status": "failed",
+                        "records": 0,
+                        "mode": mode,
+                        "message": str(exc),
+                    })
+                    if progress_callback:
+                        try:
+                            progress_callback({"type": "subtask_failed", "task_name": task_name, "area": area, "provider": provider, "message": str(exc)})
+                        except Exception:
+                            pass
+                        emit_progress_lines(
+                            title=f"{task_name} - {area} - {resource} - {provider}",
+                            line1=f"{area} - {resource}",
+                            line2=f"失败: {exc}",
+                        )
+                    provider_records = []
+                for item in provider_records:
+                    records.append(normalize_record(provider, item, ",".join(config.get("resources", [])), task_name, run_time))
+                if progress_callback:
+                    try:
+                        progress_callback({"type": "subtask_done", "task_name": task_name, "area": area, "level": "single", "provider": provider, "count": len(provider_records)})
+                    except Exception:
+                        pass
+                    emit_progress_lines(
+                        title=f"{task_name} - {area} - {resource} - {provider}",
+                        line1=f"{area} - {resource}",
+                        line2=f"成功, 数据数量: {len(provider_records)}",
+                    )
+
+    # finalize records
     records = dedupe_records(records)
     if config.get("incremental", True):
         existing_keys = load_existing_keys(config.get("results_dir", "POI_Data"))
         records = dedupe_records(records, existing_keys=existing_keys)
+
     if not records:
         entry = {
             "task_name": task_name,
@@ -558,14 +921,21 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual")
             "mode": mode,
             "message": "无新增数据。",
         }
+        entry["area"] = normalize_area(entry.get("area", ""))
         append_log(config["logs_path"], entry)
+        if progress_callback:
+            try:
+                progress_callback({"type": "task_done", "task_name": task_name, "records": 0})
+            except Exception:
+                pass
         return entry
+
+    # save outputs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     date_folder = datetime.now().strftime("%Y-%m-%d")
     base_dir = Path(config.get("results_dir", "POI_Data"))
     output_base = base_dir / date_folder / f"{task_name}_{timestamp}"
     saved_paths: List[str] = []
-    # determine export formats: prefer single global `export_format`, fall back to legacy list
     formats: List[str] = []
     if config.get("export_format"):
         formats = [config.get("export_format")]
@@ -580,25 +950,33 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual")
             saved_paths.append(save_to_excel(records, f"{output_base}.xlsx"))
         except ImportError as exc:
             saved_paths.append(f"excel-export-failed: {exc}")
+
     entry = {
         "task_name": task_name,
         "run_time": run_time,
         "area": area,
+        "provider": ",".join([PROVIDER_DISPLAY.get(p, p) for p in providers]),
         "status": "success",
         "records": len(records),
         "mode": mode,
         "message": "; ".join(saved_paths),
     }
+    entry["area"] = normalize_area(entry.get("area", ""))
     append_log(config["logs_path"], entry)
+    if progress_callback:
+        try:
+            progress_callback({"type": "task_done", "task_name": task_name, "records": len(records)})
+        except Exception:
+            pass
     return entry
 
 
-def run_tasks(tasks: List[Dict[str, Any]], config: Dict[str, Any], mode: str = "manual") -> List[Dict[str, Any]]:
+def run_tasks(tasks: List[Dict[str, Any]], config: Dict[str, Any], mode: str = "manual", progress_callback=None, stop_event=None) -> List[Dict[str, Any]]:
     results = []
     for task in tasks:
         if not task.get("enabled", True):
             continue
-        result = run_task(task, config, mode=mode)
+        result = run_task(task, config, mode=mode, progress_callback=progress_callback, stop_event=stop_event)
         results.append(result)
     return results
 
@@ -696,6 +1074,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-failed", action="store_true", help="重试失败任务")
     parser.add_argument("--allow-auto-start", action="store_true", help="程序启动时执行调度任务")
     return parser.parse_args()
+
+
+def load_config(path: str) -> Dict[str, Any]:
+    # load using config_loader and merge with DEFAULT_CONFIG
+    try:
+        cfg = config_loader.load_config(path)
+    except Exception:
+        return create_default_config(path)
+    merged = DEFAULT_CONFIG.copy()
+    if isinstance(cfg, dict):
+        merged.update(cfg)
+    return merged
 
 
 def retry_failed_tasks(config: Dict[str, Any]) -> List[Dict[str, Any]]:
