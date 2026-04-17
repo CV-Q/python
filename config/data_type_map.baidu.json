@@ -1,0 +1,7 @@
+{
+  "gas_station": ["加油站"],
+  "service_area": ["服务区"],
+  "hospital": ["医院"],
+  "repair_factory": ["维修厂", "汽车修理厂"],
+  "restaurant": ["餐馆", "快餐", "中餐馆"]
+}
