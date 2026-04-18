@@ -1,124 +1,73 @@
-# POI Fetcher (保障资源 POI 抓取与调度工具)
+# POI 抓取工具 — 使用说明（简明）
 
-简要说明：这是一个用于抓取百度/高德/腾讯等地图服务 POI 的调度器与工具，支持任务配置、调度、并发执行以及 CSV/JSON/Excel 导出。
+简介
+本工具用于按任务配置从多个地图供应商（百度/高德/天地图等）抓取 POI 数据，支持增量导出、区域展开（省/市/县/网格）、调度与 GUI 操作。
 
-主要变更（最近一次提交）：
+依赖环境
+- Python 3.8+
+- 建议在虚拟环境中安装依赖：
+  - `pip install -r requirements.txt`
+  - 若需要 Excel 导出，请安装 `openpyxl`。
 
-- 将通用工具提取到 `poi_utils.py`（I/O、导出、日志、去重、坐标转换等）。
-- 将地图提供商客户端提取到 `providers.py`（`fetch_baidu`、`fetch_gaode`、`fetch_tencent`、`fetch_provider_records`）。
-- 将 PyQt GUI 提取到 `gui_pyqt.py`（`create_gui_pyqt`），并在 `map_poi_fetcher.py` 中使用延迟导入代理。
-- 在 `archive/` 中保留了 `map_poi_fetcher_pyqt_backup.py` 作为 GUI 的归档备份。
-- 运行并通过了语法检查与快速 smoke test（`map_poi_fetcher.py --help`）。
+主要文件与目录
+- `map_poi_fetcher.py`：核心调度与抓取逻辑（包含任务运行、缓存处理、区域规范化等）。
+- `providers.py`：各地图供应商的网络请求实现（fetch_provider_records）。
+- `gui_pyqt.py`：PyQt5 图形界面实现（推荐使用 GUI 操作任务/更新行政区）。
+- `config/poi_config.json`：主配置文件，包含 api_keys、tasks、resources 等。
+- `config/region_cache.json`：行政区缓存（仅保存名字或简化结构），GUI 从此构建区划树。
+- `POI_Data/`：抓取结果输出目录（按日期分文件夹）。
+- `logs/poi_fetcher_logs.jsonl`：运行日志文件。
+- `tools/`：包含若干本地验证/模拟脚本（便于回归测试）。
 
-快速开始：
+快速开始
+1. 准备配置文件：
+   - 复制 `config/poi_config.example.json` 到 `config/poi_config.json`，填写 `api_keys`（baidu/gaode/tianditu）。
+2. 安装依赖：
+   - `pip install -r requirements.txt`
+3. 启动 GUI：
+   - `python map_poi_fetcher.py --gui --config config/poi_config.json`
+4. 使用说明（GUI）：
+   - 首次启动不会联网拉取行政区；如果需要更新行政区，请在 GUI 点击 “更新行政区” 并选择要拉取的省份（例如：京津冀+山西+陕西+河南+湖北）。
+   - 配置任务（任务名、区域类型、资源类型、是否启用增量等），保存后单击“开始”运行任务。
 
-1. 安装依赖（建议在虚拟环境中）：
+关于行政区缓存与联网策略
+- 程序启动时不会自动联网获取行政区数据，以避免无意的外网请求。只有在用户显式点击“更新行政区”时，才会调用高德（或其他）API并把抓取到的省/市/区数据合并到 `config/region_cache.json`。
+- 为避免命名不一致导致的重复/缺失，工具内置了 `unify_region_cache` 来规范化 `region_cache` 的顶层省名（例如："河南" 与 "河南省" 会合并为统一键）。
 
-```bash
-pip install -r requirements.txt
-# 可选：pip install PyQt5 openpyxl
-```
+增量（incremental）策略
+- 增量文件保存在 `POI_Data/YYYY-MM-DD/任务名_incremental.csv`。
+- 去重逻辑：仅与该增量文件中的 key 做比对，不会与历史所有文件合并去重（满足每任务增量的需求）。
 
-2. 初始化默认配置：
+常见操作命令
+- 列出任务：`python map_poi_fetcher.py --list-tasks --config config/poi_config.json`
+- 执行单个任务：`python map_poi_fetcher.py --run-task "任务名" --config config/poi_config.json`
+- 执行所有任务：`python map_poi_fetcher.py --run-all --config config/poi_config.json`
+- 导出日志：`python map_poi_fetcher.py --export-logs logs_export.json --config config/poi_config.json`
 
-```
-python map_poi_fetcher.py --init-config
-```
+更新记录（简要）
+- v0.2.0 (2026-04-18): 规范化 `region_cache` 并延后首次联网；GUI 从缓存加载；补充中文注释与使用说明文档；整合 USAGE 文档并修复若干语法/缩进问题，重构 `providers` 实现以改进天地图与高德的兼容性。本版本包含以下提交：
+   - 165dd97 2026-04-17 chore: add provider data_type_map JSON files (gaode/tianditu/baidu) and conversion script
+   - e03ff45 2026-04-16 feat: auto-generate provider-specific minimal config after first successful provider response
+   - ab39ced 2026-04-16 feat(gui): add region/resources tree multi-select UI and support Tianditu in provider dropdown
+   - d816af1 2026-04-16 feat: add Tianditu provider and provider-specific config support; replace Tencent with Tianditu
+   - 52e59bd 2026-04-16 chore: freeze dependencies and update requirements.txt
+   - 5123acf 2026-04-16 docs: document desensitized config example and .gitignore update
+   - 6584700 2026-04-16 chore: add desensitized config example and update .gitignore to exclude secrets and build artifacts
+   - c09eca0 2026-04-13 docs: normalize changelog format in README
+   - 0bcc5b6 2026-04-13 docs: add brief summary of recent updates
+   - c2a28dc 2026-04-13 docs: update README with latest commit 8ef4265
+- v0.1.0: 规范化 region_cache 并延后首次联网；GUI 从缓存加载；补充中文注释与使用说明文档。
 
-3. 运行图形界面（PyQt，可选）：
+故障排查
+- 若 GUI 未显示某省/市：请先在 GUI 中点击“更新行政区”并选择相关省份进行合并；或运行 `tools/run_unify_cache.py` 来执行缓存规范化。
+- 若抓取结果为空或数量异常：检查 `config/poi_config.json` 中的 `api_keys` 与 `provider` 设置，查看 `logs/poi_fetcher_logs.jsonl` 中的异常信息。
 
-```
-python map_poi_fetcher.py --gui
-```
+联系我们
+- 若需进一步帮助，请在工作区内打开 issues 或直接在代码注释中查找维护者联系方式（如有）。
 
-4. 命令行帮助：
-
-```
-python map_poi_fetcher.py --help
-```
-
-注意事项：
-
+注意事项
 - 使用 provider API 需要在配置文件中设置相应的 API key（`config/poi_config.json`）。
 - Excel 导出需要 `openpyxl`。
 
-并发与速率限制建议：
-
-- `max_concurrency`：全局并发上限，默认用于 GUI 中任务执行器和作为其它并发设置的默认备份值。增大此值会提高并发任务的吞吐，但也会增加对 CPU、网络和第三方 API 的压力，建议在 1–8 之间根据机器与 API 配额调整。
-- `province_expand_concurrency`：当在界面选择“省 -> 全部城市”展开抓取（即城市选择为“全部”）时，控制同时并发请求多少个市。建议值 2–4（比 `max_concurrency` 更保守），可在 GUI 的“全局设置”中配置。
-- `province_expand_delay_seconds`：全局最小请求间隔（秒），用于在省级展开时对请求做速率限制以避免触发 API 限速或短时间内被封禁。默认 0.5s；对百度类接口建议设置为 0.8–1.5s 更稳妥。当前实现基于全局锁与 `last_call` 时间实现简易间隔控制；若需更平滑的速率控制（令牌桶等），可进一步改进实现。
-
-使用建议：
-
-- 对于小规模抓取（单市或少量市），`province_expand_concurrency` 可设置较低以减少并发压力。
-- 对于覆盖整省的批量抓取，优先降低并发并增加 `province_expand_delay_seconds`，以防 API 响应不完整或被限流。
-- 在生产环境运行前，请先在小范围内（1-2 个市）测试配置，确认不会触发第三方服务的限流或错误返回。
-
-确保“无并发”与统一延迟（针对省/市/区县的应用说明）
-
-- 目标：不使用并发，且把省展开时的并发数与延迟作为所有 POI 查询的并发/延迟策略（包括市与区县）。
-- 推荐配置：在 `config/poi_config.json`（或通过 GUI 全局设置）将以下项设置为：
-
-```json
-{
-	"province_expand_concurrency": 1,
-	"province_expand_delay_seconds": 1.0
-}
-```
-
-- 含义：
-    - `province_expand_concurrency = 1`：省级展开时按序处理城市（不并发）。
-    - `province_expand_delay_seconds = 1.0`：全局最小请求间隔为 1 秒，代码会在每次对第三方 provider 发起请求前确保至少间隔该时长（适用于省/市/区县级别的所有查询）。
-- 行为细节：当任务在市级选择为“全部”时，程序会遍历该市下的区/县并逐一查询（顺序执行、受上述延迟控制）；当任务在省级选择为“全部”时，程序会遍历省内各市并对每市按需遍历区/县，均为顺序执行且受统一延迟控制。
-- 验证：在小规模（1-2 个市）运行任务并在日志中观察请求时间戳，确认相邻请求之间的时间差不小于 `province_expand_delay_seconds`。
-
-回退与历史：归档文件存放在 `archive/`，如果需要恢复旧实现，可参考其中的备份文件。
-
-作者/维护：项目重构由团队进行，变更已提交到本地 git 仓库。
-
-更新记录（按时间倒序，最近重要提交）：
-
-- `0bcc5b6` (2026-04-13) — docs: add brief summary of recent updates
-    - 在 README 中添加本次更新的简要摘要，归纳 GUI 与后端改动要点。
-- `8ef4265` (2026-04-13) — chore(gui): expose scheduler.check_interval_minutes; localize provider names; resource example; fix global save button
-    - 在 GUI 中暴露 `scheduler.check_interval_minutes`（调度检查间隔，单位：分钟）。
-    - 将“提供商”下拉本地化为中文显示（百度/高德/腾讯），保存时映射为内部键。
-    - 将 `资源` 示例改为英文 JSON（如 `["gas_station","service_area","hospital"]`），并支持粘贴 JSON 列表或以中/英文逗号分隔的关键词；保存时智能解析并写入配置。
-    - 修复并绑定“保存全局设置”按钮，确保在全局设置页点击后能正确写入配置文件。
-- `9749040` (2026-04-13) — feat: add '全部' UI options; expand province->cities with configurable concurrency/rate-limit
-    - 在城市与区县下拉中加入“全部”选项；当任务城市字段为空（表示“全部”）时，`run_task` 会展开为对该省下所有城市逐市抓取并合并去重结果，提升省级抓取完整性。
-    - 新增并发/速率控制配置：`province_expand_concurrency` 与 `province_expand_delay_seconds`，可在 GUI 中调整以避免触发第三方 API 限流。
-    - 单市抓取失败会记录为子任务失败日志，但不会中断整个省级任务，便于重试与故障排查。
-
-完整历史请使用 `git log --oneline` 或 `git show <commit>` 查看详细条目。
-
-注意：省级展开会大量增加对第三方地图服务的请求量，请在生产环境使用前配置合适的并发与延迟并先在小规模上进行试验。
-
-- 归档与回退：保留了原 Tk 界面与早期 PyQt 实现的备份文件在 `archive/` 目录，便于回退与对比。
-
-注意：省级展开会大量增加对第三方地图服务的请求量，请在生产环境使用前配置合适的并发与延迟并先在小规模上进行试验。
-
-**本次更新摘要**
-
-- 本次提交（短哈希：8ef4265 / README 提交：c2a28dc）：
-    - 在 GUI 中暴露并可配置 `scheduler.check_interval_minutes`（调度检查间隔，单位：分钟）。
-    - 将“提供商”下拉本地化为中文显示（百度 / 高德 / 腾讯），并在保存时映射为内部键。
-    - 将 `资源` 示例改为英文 JSON（例如 `["gas_station","service_area","hospital"]`），并在界面中显示为可复制的示例。
-    - 支持在 `资源` 输入中粘贴 JSON 列表，或使用英文/中文逗号分隔的关键字；保存时会智能解析并写入配置。
-    - 修复了“保存全局设置”按钮未绑定的问题（`保存全局设置` 现在会调用保存函数并写入配置文件）。
-    - 后端 `map_poi_fetcher.py` 支持将未知资源项作为原生关键词（支持中文关键词），并按中/英文逗号拆分，保留原有已知资源展开逻辑。
-
-**本次提交：脱敏配置与忽略规则**
-
-- 新增 `config/poi_config.example.json`：脱敏示例配置，`api_keys` 字段已替换为 "<REDACTED>"，用于在不暴露真实密钥的情况下运行或共享。
-- 新增 `.gitignore`：已添加规则以忽略 `config/poi_config.json`、`POI_Data/`、`logs/`、`build/`、`bin/` 等运行与构建产物。
-
-使用说明：
-
-- 已在仓库根生成 `config/poi_config.example.json`，请使用该示例作为共享或存档版本。
-- 请勿将 `config/poi_config.json`（含真实 API keys）提交到远程仓库；真实密钥应存放在安全的秘钥管理系统或环境变量中。
-
-后续选项：
-
-- 我可以为您生成并提交 `requirements.freeze.txt`（可复现依赖快照）。
-- 如果需要彻底从 Git 历史中移除已泄露的密钥，我可以指导或执行使用 `git-filter-repo` / BFG 的清理步骤（这将重写历史，请谨慎）。
+后续建议
+- 我可以将此 README 同步到 docs/USAGE.md（保持两处一致），或仅保留 README 为单一说明文件，您偏好哪种？
