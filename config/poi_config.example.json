@@ -102,7 +102,6 @@
   },
   "results_dir": "POI_Data",
   "logs_path": "logs/poi_fetcher_logs.jsonl",
-  "provider": "baidu",
   "resources": [
     "gas_station",
     "service_area"

@@ -1,0 +1,988 @@
+{
+  "美食": {
+    "code": null,
+    "children": {
+      "中餐厅": {
+        "code": null
+      },
+      "外国餐厅": {
+        "code": null
+      },
+      "小吃快餐店": {
+        "code": null
+      },
+      "蛋糕甜品店": {
+        "code": null
+      },
+      "咖啡厅": {
+        "code": null
+      },
+      "茶座": {
+        "code": null
+      },
+      "酒吧": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "酒店": {
+    "code": null,
+    "children": {
+      "星级酒店": {
+        "code": null
+      },
+      "快捷酒店": {
+        "code": null
+      },
+      "公寓式酒店": {
+        "code": null
+      },
+      "民宿": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "购物": {
+    "code": null,
+    "children": {
+      "购物中心": {
+        "code": null
+      },
+      "百货商场": {
+        "code": null
+      },
+      "超市": {
+        "code": null
+      },
+      "便利店": {
+        "code": null
+      },
+      "家居建材": {
+        "code": null
+      },
+      "家电数码": {
+        "code": null
+      },
+      "商铺": {
+        "code": null
+      },
+      "市场": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "生活服务": {
+    "code": null,
+    "children": {
+      "通讯营业厅": {
+        "code": null
+      },
+      "邮局": {
+        "code": null
+      },
+      "物流公司": {
+        "code": null
+      },
+      "售票处": {
+        "code": null
+      },
+      "洗衣店": {
+        "code": null
+      },
+      "图文快印店": {
+        "code": null
+      },
+      "照相馆": {
+        "code": null
+      },
+      "房产中介机构": {
+        "code": null
+      },
+      "公用事业": {
+        "code": null
+      },
+      "维修点": {
+        "code": null
+      },
+      "家政服务": {
+        "code": null
+      },
+      "殡葬服务": {
+        "code": null
+      },
+      "彩票销售点": {
+        "code": null
+      },
+      "宠物服务": {
+        "code": null
+      },
+      "报刊亭": {
+        "code": null
+      },
+      "公共厕所": {
+        "code": null
+      },
+      "步骑行专用道驿站": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "丽人": {
+    "code": null,
+    "children": {
+      "美容": {
+        "code": null
+      },
+      "美发": {
+        "code": null
+      },
+      "美甲": {
+        "code": null
+      },
+      "美体": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "旅游景点": {
+    "code": null,
+    "children": {
+      "公园": {
+        "code": null
+      },
+      "动物园": {
+        "code": null
+      },
+      "植物园": {
+        "code": null
+      },
+      "游乐园": {
+        "code": null
+      },
+      "博物馆": {
+        "code": null
+      },
+      "水族馆": {
+        "code": null
+      },
+      "海滨浴场": {
+        "code": null
+      },
+      "文物古迹": {
+        "code": null
+      },
+      "教堂": {
+        "code": null
+      },
+      "风景区": {
+        "code": null
+      },
+      "景点": {
+        "code": null
+      },
+      "寺庙": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "休闲娱乐": {
+    "code": null,
+    "children": {
+      "度假村": {
+        "code": null
+      },
+      "农家院": {
+        "code": null
+      },
+      "电影院": {
+        "code": null
+      },
+      "ktv": {
+        "code": null
+      },
+      "剧院": {
+        "code": null
+      },
+      "歌舞厅": {
+        "code": null
+      },
+      "网吧": {
+        "code": null
+      },
+      "游戏场所": {
+        "code": null
+      },
+      "洗浴按摩": {
+        "code": null
+      },
+      "休闲广场": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "运动健身": {
+    "code": null,
+    "children": {
+      "体育场馆": {
+        "code": null
+      },
+      "极限运动场所": {
+        "code": null
+      },
+      "健身中心": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "教育培训": {
+    "code": null,
+    "children": {
+      "高等院校": {
+        "code": null
+      },
+      "中学": {
+        "code": null
+      },
+      "小学": {
+        "code": null
+      },
+      "幼儿园": {
+        "code": null
+      },
+      "成人教育": {
+        "code": null
+      },
+      "亲子教育": {
+        "code": null
+      },
+      "特殊教育学校": {
+        "code": null
+      },
+      "留学中介机构": {
+        "code": null
+      },
+      "科研机构": {
+        "code": null
+      },
+      "培训机构": {
+        "code": null
+      },
+      "图书馆": {
+        "code": null
+      },
+      "科技馆": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "文化传媒": {
+    "code": null,
+    "children": {
+      "新闻出版": {
+        "code": null
+      },
+      "广播电视": {
+        "code": null
+      },
+      "艺术团体": {
+        "code": null
+      },
+      "美术馆": {
+        "code": null
+      },
+      "展览馆": {
+        "code": null
+      },
+      "文化宫": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "医疗": {
+    "code": null,
+    "children": {
+      "综合医院": {
+        "code": null
+      },
+      "专科医院": {
+        "code": null
+      },
+      "诊所": {
+        "code": null
+      },
+      "药店": {
+        "code": null
+      },
+      "体检机构": {
+        "code": null
+      },
+      "疗养院": {
+        "code": null
+      },
+      "急救中心": {
+        "code": null
+      },
+      "疾控中心": {
+        "code": null
+      },
+      "医疗器械": {
+        "code": null
+      },
+      "医疗保健": {
+        "code": null
+      },
+      "核酸检测点": {
+        "code": null
+      },
+      "新冠疫苗接种点": {
+        "code": null
+      },
+      "风险点": {
+        "code": null
+      },
+      "方舱医院": {
+        "code": null
+      },
+      "发热门诊": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "汽车服务": {
+    "code": null,
+    "children": {
+      "汽车销售": {
+        "code": null
+      },
+      "汽车维修": {
+        "code": null
+      },
+      "汽车美容": {
+        "code": null
+      },
+      "汽车配件": {
+        "code": null
+      },
+      "汽车租赁": {
+        "code": null
+      },
+      "汽车检测场": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "交通设施": {
+    "code": null,
+    "children": {
+      "飞机场": {
+        "code": null
+      },
+      "火车站": {
+        "code": null
+      },
+      "地铁站": {
+        "code": null
+      },
+      "地铁线路": {
+        "code": null
+      },
+      "长途汽车站": {
+        "code": null
+      },
+      "公交车站": {
+        "code": null
+      },
+      "港口": {
+        "code": null
+      },
+      "停车场": {
+        "code": null
+      },
+      "停车区": {
+        "code": null
+      },
+      "停车位": {
+        "code": null
+      },
+      "加油加气站": {
+        "code": null
+      },
+      "服务区": {
+        "code": null
+      },
+      "收费站": {
+        "code": null
+      },
+      "桥": {
+        "code": null
+      },
+      "充电站": {
+        "code": null
+      },
+      "路侧停车位": {
+        "code": null
+      },
+      "普通停车位": {
+        "code": null
+      },
+      "接送点": {
+        "code": null
+      },
+      "电动自行车充电站": {
+        "code": null
+      },
+      "高速公路停车区": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "金融": {
+    "code": null,
+    "children": {
+      "银行": {
+        "code": null
+      },
+      "ATM": {
+        "code": null
+      },
+      "信用社": {
+        "code": null
+      },
+      "投资理财": {
+        "code": null
+      },
+      "典当行": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "房地产": {
+    "code": null,
+    "children": {
+      "写字楼": {
+        "code": null
+      },
+      "住宅区": {
+        "code": null
+      },
+      "宿舍": {
+        "code": null
+      },
+      "内部楼栋": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "公司企业": {
+    "code": null,
+    "children": {
+      "公司": {
+        "code": null
+      },
+      "园区": {
+        "code": null
+      },
+      "农林园艺": {
+        "code": null
+      },
+      "厂矿": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "政府机构": {
+    "code": null,
+    "children": {
+      "中央机构": {
+        "code": null
+      },
+      "各级政府": {
+        "code": null
+      },
+      "行政单位": {
+        "code": null
+      },
+      "公检法机构": {
+        "code": null
+      },
+      "涉外机构": {
+        "code": null
+      },
+      "党派团体": {
+        "code": null
+      },
+      "福利机构": {
+        "code": null
+      },
+      "政治教育机构": {
+        "code": null
+      },
+      "社会团体": {
+        "code": null
+      },
+      "民主党派": {
+        "code": null
+      },
+      "居民委员会": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "出入口": {
+    "code": null,
+    "children": {
+      "高速公路出口": {
+        "code": null
+      },
+      "高速公路入口": {
+        "code": null
+      },
+      "机场出口": {
+        "code": null
+      },
+      "机场入口": {
+        "code": null
+      },
+      "车站出口": {
+        "code": null
+      },
+      "车站入口": {
+        "code": null
+      },
+      "门（备注：建筑物和建筑物群的门）": {
+        "code": null
+      },
+      "停车场出入口": {
+        "code": null
+      },
+      "自行车高速出口": {
+        "code": null
+      },
+      "自行车高速入口": {
+        "code": null
+      },
+      "自行车高速出入口": {
+        "code": null
+      },
+      "停车场出口": {
+        "code": null
+      },
+      "停车场入口": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "自然地物": {
+    "code": null,
+    "children": {
+      "岛屿": {
+        "code": null
+      },
+      "山峰": {
+        "code": null
+      },
+      "水系": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "行政地标": {
+    "code": null,
+    "children": {
+      "省": {
+        "code": null
+      },
+      "省级城市": {
+        "code": null
+      },
+      "城市": {
+        "code": null
+      },
+      "地级市": {
+        "code": null
+      },
+      "区县": {
+        "code": null
+      },
+      "商圈": {
+        "code": null
+      },
+      "乡镇": {
+        "code": null
+      },
+      "村庄": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "门址": {
+    "code": null,
+    "children": {
+      "门址点": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "道路": {
+    "code": null,
+    "children": {
+      "高速公路": {
+        "code": null
+      },
+      "国道": {
+        "code": null
+      },
+      "省道": {
+        "code": null
+      },
+      "县道": {
+        "code": null
+      },
+      "乡道": {
+        "code": null
+      },
+      "城市快速路": {
+        "code": null
+      },
+      "城市主干道": {
+        "code": null
+      },
+      "城市次干道": {
+        "code": null
+      },
+      "城市支路": {
+        "code": null
+      },
+      "车渡线": {
+        "code": null
+      },
+      "路口": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "铁路": {
+    "code": null,
+    "children": {
+      "铁路": {
+        "code": null
+      },
+      "地铁/轻轨": {
+        "code": null
+      },
+      "磁悬浮列车": {
+        "code": null
+      },
+      "有轨电车": {
+        "code": null
+      },
+      "城际快轨": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "行政界线": {
+    "code": null,
+    "children": {
+      "其他国家国界": {
+        "code": null
+      },
+      "已定国界": {
+        "code": null
+      },
+      "未定国界": {
+        "code": null
+      },
+      "港澳界线": {
+        "code": null
+      },
+      "南海范围线": {
+        "code": null
+      },
+      "已定省界": {
+        "code": null
+      },
+      "未定省界": {
+        "code": null
+      },
+      "海岸线": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "其他线要素": {
+    "code": null,
+    "children": {
+      "桥梁": {
+        "code": null
+      },
+      "隧道": {
+        "code": null
+      },
+      "行政假想线": {
+        "code": null
+      },
+      "水域假想线": {
+        "code": null
+      },
+      "绿地假想线": {
+        "code": null
+      },
+      "岛屿假想线": {
+        "code": null
+      },
+      "疫情管控区": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "行政区划": {
+    "code": null,
+    "children": {
+      "世界级": {
+        "code": null
+      },
+      "国家级": {
+        "code": null
+      },
+      "省级": {
+        "code": null
+      },
+      "市级": {
+        "code": null
+      },
+      "区县级": {
+        "code": null
+      },
+      "热点区域": {
+        "code": null
+      },
+      "建成区": {
+        "code": null
+      },
+      "智能区域": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "水系": {
+    "code": null,
+    "children": {
+      "双线河": {
+        "code": null
+      },
+      "湖沼": {
+        "code": null
+      },
+      "海洋": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "绿地": {
+    "code": null,
+    "children": {
+      "绿地公园": {
+        "code": null
+      },
+      "高尔夫球场": {
+        "code": null
+      },
+      "岛": {
+        "code": null
+      },
+      "绿化带": {
+        "code": null
+      },
+      "机场": {
+        "code": null
+      },
+      "机场道路": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "标注": {
+    "code": null,
+    "children": {
+      "大洲标注": {
+        "code": null
+      },
+      "大洋标注": {
+        "code": null
+      },
+      "海域标注": {
+        "code": null
+      },
+      "水系标注": {
+        "code": null
+      },
+      "岛屿标注": {
+        "code": null
+      },
+      "非水系标注": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "公交线路": {
+    "code": null,
+    "children": {
+      "普通日行公交车": {
+        "code": null
+      },
+      "地铁\\轻轨": {
+        "code": null
+      },
+      "有轨电车": {
+        "code": null
+      },
+      "机场巴士（前往机场）": {
+        "code": null
+      },
+      "机场巴士（从机场返回）": {
+        "code": null
+      },
+      "机场巴士（机场之间）": {
+        "code": null
+      },
+      "旅游线路车": {
+        "code": null
+      },
+      "夜班车": {
+        "code": null
+      },
+      "轮渡": {
+        "code": null
+      },
+      "快车": {
+        "code": null
+      },
+      "慢车": {
+        "code": null
+      },
+      "机场快轨（前往机场）": {
+        "code": null
+      },
+      "机场快轨（从机场返回）": {
+        "code": null
+      },
+      "机场轨道交通环路": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  },
+  "电子眼": {
+    "code": null,
+    "children": {
+      "限速电子眼": {
+        "code": null
+      },
+      "应急车道电子眼": {
+        "code": null
+      },
+      "公交车道电子眼": {
+        "code": null
+      },
+      "外地车辆电子眼": {
+        "code": null
+      },
+      "违章电子眼": {
+        "code": null
+      },
+      "其他": {
+        "code": null
+      }
+    }
+  }
+}

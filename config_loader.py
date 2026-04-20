@@ -15,7 +15,17 @@ def load_config(path: str) -> Dict[str, Any]:
         p.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
         return DEFAULT_CONFIG.copy()
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        # Normalize legacy placement: some configs store 天地图 key under 'tencent'
+        # Map it to 'tianditu' so callers can use a consistent key.
+        try:
+            ak = cfg.get("api_keys", {})
+            if isinstance(ak, dict) and "tianditu" not in ak and "tencent" in ak:
+                ak["tianditu"] = ak.get("tencent")
+                cfg["api_keys"] = ak
+        except Exception:
+            pass
+        return cfg
     except Exception:
         return DEFAULT_CONFIG.copy()
 

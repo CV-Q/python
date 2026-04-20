@@ -53,6 +53,67 @@ def save_to_csv(records: List[Dict[str, Any]], path: str) -> str:
     return str(filepath)
 
 
+def append_to_csv(records: List[Dict[str, Any]], path: str) -> int:
+    """Append records to a CSV file. Writes header if file does not exist.
+
+    Returns number of rows appended.
+    """
+    if not records:
+        return 0
+    filepath = Path(path)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not filepath.exists()
+    appended = 0
+    with filepath.open("a", encoding="utf-8-sig", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=DEFAULT_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for record in records:
+            writer.writerow({field: record.get(field, "") for field in DEFAULT_FIELDS})
+            appended += 1
+    return appended
+
+
+def append_new_records(records: List[Dict[str, Any]], path: str, existing_keys: Optional[set] = None) -> int:
+    """Append only records whose build_record_key is not in existing_keys.
+
+    Returns number appended and updates existing_keys in-place if provided.
+    """
+    existing_keys = existing_keys or set()
+    to_append: List[Dict[str, Any]] = []
+    # helper to check if a name has any coord-key in existing_keys
+    def name_has_coord(name: str) -> bool:
+        prefix = f"{name}|"
+        for k in existing_keys:
+            if k.startswith(prefix):
+                return True
+        return False
+
+    for record in records:
+        name = (record.get("name") or "").strip().lower()
+        lat = record.get("latitude")
+        lng = record.get("longitude")
+        if lat is None or lng is None:
+            # incoming record has no coords: consider it existing if either name-only
+            # key exists or any coord-key for same name exists
+            if name in existing_keys or name_has_coord(name):
+                continue
+            key = name
+            existing_keys.add(key)
+            to_append.append(record)
+        else:
+            # incoming record has coords: build primary key
+            key = f"{name}|{round(float(lat),6)}|{round(float(lng),6)}"
+            # consider existing if primary exists or name-only exists
+            if key in existing_keys or name in existing_keys:
+                continue
+            existing_keys.add(key)
+            to_append.append(record)
+    if not to_append:
+        return 0
+    return append_to_csv(to_append, path)
+
+
 def save_to_json(records: List[Dict[str, Any]], path: str) -> str:
     filepath = Path(path)
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +141,41 @@ def append_log(log_path: str, entry: Dict[str, Any]) -> None:
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with filepath.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def make_log_entry(task_name: str, run_time: str, area: str, status: str, records: int = 0, provider: str = "", message: str = "") -> Dict[str, Any]:
+    # normalize area string to remove empty segments and extra spaces
+    def _normalize(a: str) -> str:
+        try:
+            if not a:
+                return ""
+            parts = [p.strip() for p in str(a).split("/")]
+            parts = [p for p in parts if p]
+            return " / ".join(parts)
+        except Exception:
+            return str(a)
+
+    return {
+        "task_name": task_name,
+        "run_time": run_time,
+        "area": _normalize(area),
+        "status": status,
+        "records": records,
+        "provider": provider,
+        "message": message,
+    }
+
+
+def normalize_area(area: str) -> str:
+    """Normalize area strings by splitting on '/' and joining non-empty, stripped parts with ' / '."""
+    try:
+        if not area:
+            return ""
+        parts = [p.strip() for p in str(area).split("/")]
+        parts = [p for p in parts if p]
+        return " / ".join(parts)
+    except Exception:
+        return str(area)
 
 
 def load_logs(log_path: str) -> List[Dict[str, Any]]:
@@ -125,9 +221,29 @@ def dedupe_records(records: List[Dict[str, Any]], existing_keys: Optional[set] =
     existing_keys = existing_keys or set()
     deduped: List[Dict[str, Any]] = []
     seen = set(existing_keys)
+
+    def name_has_coord_in_seen(name: str) -> bool:
+        prefix = f"{name}|"
+        for k in seen:
+            if k.startswith(prefix):
+                return True
+        return False
+
     for record in records:
-        key = build_record_key(record)
-        if key and key not in seen:
+        name = (record.get("name") or "").strip().lower()
+        lat = record.get("latitude")
+        lng = record.get("longitude")
+        if lat is None or lng is None:
+            # incoming has no coords: skip if name-only seen or any coord for name seen
+            if name in seen or name_has_coord_in_seen(name):
+                continue
+            seen.add(name)
+            deduped.append(record)
+        else:
+            key = f"{name}|{round(float(lat),6)}|{round(float(lng),6)}"
+            # skip if exact key or name-only seen
+            if key in seen or name in seen:
+                continue
             seen.add(key)
             deduped.append(record)
     return deduped
@@ -152,6 +268,43 @@ def load_existing_keys(results_dir: str) -> set:
                         keys.add(build_record_key(row))
             except Exception:
                 continue
+    return keys
+
+
+def load_keys_from_file(path: str) -> set:
+    """Load dedupe keys from a single CSV or JSON file.
+
+    Returns a set of build_record_key() values for records already present
+    in the given file. If the path does not exist or cannot be read, an
+    empty set is returned.
+    """
+    keys = set()
+    p = Path(path)
+    if not p.exists():
+        return keys
+    if p.is_file():
+        if p.suffix.lower() == ".csv":
+            try:
+                with p.open("r", encoding="utf-8-sig", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            keys.add(build_record_key(row))
+                        except Exception:
+                            continue
+            except Exception:
+                return set()
+        elif p.suffix.lower() == ".json":
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for row in data:
+                        try:
+                            keys.add(build_record_key(row))
+                        except Exception:
+                            continue
+            except Exception:
+                return set()
     return keys
 
 

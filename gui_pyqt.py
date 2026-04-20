@@ -9,6 +9,7 @@ import queue
 import threading
 import json
 import re
+import ast
 import concurrent.futures
 import config_loader
 
@@ -18,17 +19,23 @@ def create_gui_pyqt(config_path: str) -> None:
         print("PyQt5 未安装。请通过 'pip install PyQt5' 安装后重试。")
         return
 
-    # delay-import heavy application helpers to avoid circular import at module import time
+    # 延迟导入重量级应用辅助函数以避免模块导入时的循环依赖
     from map_poi_fetcher import (
         ensure_region_data,
         fetch_amap_subdistrict,
+        fetch_and_save_region_hierarchy,
+        load_region_cache,
+        unify_region_cache,
         get_task_area_summary,
         run_task,
         run_tasks,
-        # log helpers
+        # 日志辅助函数
         load_logs,
         export_logs,
         PROVIDER_DISPLAY,
+        # 缓存辅助函数
+        save_region_cache,
+        get_region_cache_path,
     )
 
     app = QtWidgets.QApplication([])
@@ -38,21 +45,23 @@ def create_gui_pyqt(config_path: str) -> None:
     win.setCentralWidget(central)
     layout = QtWidgets.QVBoxLayout(central)
 
-    # top: config path and save/load
+    # 顶部：配置路径显示与加载/保存按钮
     top_h = QtWidgets.QHBoxLayout()
     config_edit = QtWidgets.QLineEdit(config_path)
     top_h.addWidget(QtWidgets.QLabel("配置文件："))
     top_h.addWidget(config_edit)
     btn_load = QtWidgets.QPushButton("刷新配置")
+    btn_update_regions = QtWidgets.QPushButton("更新行政区(京津冀+山西+陕西+河南+湖北)")
     btn_save = QtWidgets.QPushButton("保存配置")
     top_h.addWidget(btn_load)
+    top_h.addWidget(btn_update_regions)
     top_h.addWidget(btn_save)
     layout.addLayout(top_h)
 
     splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
     layout.addWidget(splitter, 1)
 
-    # left: task list and buttons
+    # 左侧：任务列表与控制按钮
     left_w = QtWidgets.QWidget()
     left_l = QtWidgets.QVBoxLayout(left_w)
     task_list = QtWidgets.QListWidget()
@@ -60,19 +69,25 @@ def create_gui_pyqt(config_path: str) -> None:
     hb = QtWidgets.QHBoxLayout()
     btn_add = QtWidgets.QPushButton("新增任务")
     btn_delete = QtWidgets.QPushButton("删除任务")
+    btn_select_tasks = QtWidgets.QPushButton("全选/取消全选")
     btn_run = QtWidgets.QPushButton("运行选中任务")
     btn_run_all = QtWidgets.QPushButton("运行全部任务")
     btn_stop = QtWidgets.QPushButton("停止任务")
     btn_stop.setEnabled(False)
     hb.addWidget(btn_add)
     hb.addWidget(btn_delete)
+    hb.addWidget(btn_select_tasks)
     hb.addWidget(btn_run)
     hb.addWidget(btn_run_all)
     hb.addWidget(btn_stop)
     left_l.addLayout(hb)
+    # 实时日志区域（摘要信息）
+    logs = QtWidgets.QTextEdit(); logs.setReadOnly(True)
+    left_l.addWidget(QtWidgets.QLabel("日志输出（实时摘要）"))
+    left_l.addWidget(logs, 1)
     splitter.addWidget(left_w)
 
-    # right: task editor + global settings + logs
+    # 右侧：任务编辑器、全局设置与日志查询
     right_w = QtWidgets.QWidget()
     right_l = QtWidgets.QVBoxLayout(right_w)
 
@@ -87,20 +102,15 @@ def create_gui_pyqt(config_path: str) -> None:
     form.addRow("选择模式：", area_type_combo)
     country_label = QtWidgets.QLabel("中华人民共和国")
     form.addRow("国家：", country_label)
-    province_combo = QtWidgets.QComboBox()
-    city_combo = QtWidgets.QComboBox()
-    county_combo = QtWidgets.QComboBox()
-    form.addRow("省份：", province_combo)
-    form.addRow("城市：", city_combo)
-    form.addRow("区/县：", county_combo)
 
-    # Region tree: allow multi-select of provinces/cities/counties with parent-child checkbox behavior
+    # 地区树：支持省市县多选，父子节点联动勾选行为
     region_tree = QtWidgets.QTreeWidget()
     region_tree.setHeaderLabels(["地区 (多选)"])
     region_tree.setColumnCount(1)
     region_tree.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
     region_tree.setUniformRowHeights(True)
     form.addRow("地区选择：", region_tree)
+    # (原先地区的全选按钮已移至任务列表区)
 
     bbox_left = QtWidgets.QLineEdit()
     bbox_bottom = QtWidgets.QLineEdit()
@@ -111,48 +121,44 @@ def create_gui_pyqt(config_path: str) -> None:
     form.addRow("BBox 右：", bbox_right)
     form.addRow("BBox 上：", bbox_top)
 
+    # 每个任务的提供商、资源与导出选项将在创建控件后添加
+
     save_task_btn = QtWidgets.QPushButton("保存任务")
-    form.addRow(save_task_btn)
 
     def update_mode_ui():
         cur = area_type_combo.currentText()
         mode_val = type_display_to_value.get(cur, cur)
         is_admin = (mode_val == "admin")
-        province_combo.setEnabled(is_admin)
-        city_combo.setEnabled(is_admin)
-        county_combo.setEnabled(is_admin)
+        # 已移除单选下拉；仅控制 bbox 输入的启用/禁用
         bbox_left.setEnabled(not is_admin)
         bbox_bottom.setEnabled(not is_admin)
         bbox_right.setEnabled(not is_admin)
         bbox_top.setEnabled(not is_admin)
 
-    # Use a tab widget: Task 编辑页 和 全局设置页
+    # 使用选项卡：任务编辑 与 全局设置
     tabs = QtWidgets.QTabWidget()
     tab_task = QtWidgets.QWidget()
     tab_task_l = QtWidgets.QVBoxLayout(tab_task)
     tab_task_l.addLayout(form)
+    # 将保存按钮放在任务编辑器底部（不嵌入中间表单）
+    try:
+        tab_task_l.addWidget(save_task_btn)
+    except Exception:
+        pass
     tabs.addTab(tab_task, "任务编辑")
 
-    # Global settings tab
+    # 全局设置选项卡
     tab_global = QtWidgets.QWidget()
     tab_global_l = QtWidgets.QVBoxLayout(tab_global)
     glob_group = QtWidgets.QGroupBox("全局设置")
     glob_layout = QtWidgets.QFormLayout(glob_group)
     provider_combo = QtWidgets.QComboBox()
-    # display Chinese names, map to internal provider keys
+    # 显示中文名称，并映射到内部提供商键
     provider_display_to_value = {"百度": "baidu", "高德": "gaode", "天地图": "tianditu"}
     provider_value_to_display = {v: k for k, v in provider_display_to_value.items()}
     provider_combo.addItems(list(provider_display_to_value.keys()))
-    # resources: store as comma-separated keywords by default, but show a persistent JSON example below
-    example_resources = ["gas_station", "service_area", "hospital", "repair_factory"]
-    resources_edit = QtWidgets.QLineEdit(json.dumps(example_resources, ensure_ascii=False))
-    resources_edit.setToolTip("输入资源关键字，支持 JSON 列表或逗号分隔的关键字；示例已填入并可复制")
-    example_label = QtWidgets.QLabel(json.dumps(example_resources, ensure_ascii=False))
-    # allow users to select/copy the example text
-    try:
-        example_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-    except Exception:
-        pass
+    # 资源选择：默认以逗号分隔关键字存储，但界面中使用资源树进行多选
+    # 已移除资源编辑行，仅使用 resources_tree 选择资源
     export_combo = QtWidgets.QComboBox()
     export_combo.addItems(["csv", "json", "excel"])
     concurrency_spin = QtWidgets.QSpinBox(); concurrency_spin.setRange(1, 32)
@@ -162,17 +168,14 @@ def create_gui_pyqt(config_path: str) -> None:
     check_interval_spin = QtWidgets.QSpinBox(); check_interval_spin.setRange(1, 1440)
     incr_check = QtWidgets.QCheckBox()
     sched_spin = QtWidgets.QSpinBox(); sched_spin.setRange(1, 365)
-    glob_layout.addRow("提供商：", provider_combo)
-    glob_layout.addRow("资源：", resources_edit)
-    glob_layout.addRow("资源示例(JSON)：", example_label)
-    glob_layout.addRow("导出格式：", export_combo)
-    # Note: concurrency, paging and scheduler options moved to Advanced tab
-    adv_note = QtWidgets.QLabel("并发/分页/调度设置已移至“高级设置”选项卡。点击高级设置进行配置。")
-    try:
-        adv_note.setWordWrap(True)
-    except Exception:
-        pass
-    glob_layout.addRow(adv_note)
+    # glob_layout.addRow("说明：", QtWidgets.QLabel("提供商与资源已移至任务编辑；导出格式在任务编辑可见但仍为全局设置。"))
+    # # 注意：并发、分页与调度选项已移至“高级设置”选项卡
+    # adv_note = QtWidgets.QLabel("并发/分页/调度设置已移至“高级设置”选项卡。点击高级设置进行配置。")
+    # try:
+    #     adv_note.setWordWrap(True)
+    # except Exception:
+    #     pass
+    # glob_layout.addRow(adv_note)
     tab_global_l.addWidget(glob_group)
     # Resources tree for multi-select resource types (parent select -> select children)
     resources_tree = QtWidgets.QTreeWidget()
@@ -183,13 +186,19 @@ def create_gui_pyqt(config_path: str) -> None:
         resources_tree.setUniformRowHeights(True)
     except Exception:
         pass
-    tab_global_l.addWidget(QtWidgets.QLabel("资源树（若需要可直接勾选）"))
-    tab_global_l.addWidget(resources_tree)
+    # add per-task UI into the task editor form (provider, resources, export)
+    try:
+        form.addRow("提供商：", provider_combo)
+        form.addRow("资源：", resources_tree)
+        form.addRow("导出格式（全局）：", export_combo)
+    except Exception:
+        pass
+    # resources_tree UI moved to task editor form; keep global tab minimal
     # add explicit save button inside global tab
     btn_save_global = QtWidgets.QPushButton("保存全局设置")
     tab_global_l.addWidget(btn_save_global)
     # advanced save button will be created below and wired to the same save logic
-    tabs.addTab(tab_global, "全局设置")
+    # 全局设置页已移除，相关选项保留在高级设置和任务编辑中
 
     # Advanced settings tab (for concurrency, paging and scheduler settings)
     tab_advanced = QtWidgets.QWidget()
@@ -210,27 +219,22 @@ def create_gui_pyqt(config_path: str) -> None:
 
     right_l.addWidget(tabs)
 
-    # logs
-    logs = QtWidgets.QTextEdit(); logs.setReadOnly(True)
-    right_l.addWidget(QtWidgets.QLabel("日志输出（实时摘要）"))
-    right_l.addWidget(logs, 1)
-
     splitter.addWidget(right_w)
 
-    # load config and region data
+    # 加载配置与区域数据
     cfg_path = config_edit.text()
     current_cfg = config_loader.load_config(cfg_path)
     region_data = ensure_region_data(cfg_path, current_cfg.get("api_keys", {}).get("gaode", ""))
 
     logs_queue: "queue.Queue[str]" = queue.Queue()
-    # executor for PyQt GUI
+    # PyQt GUI 的线程池执行器
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(current_cfg.get("max_concurrency", 1)))
-    # running state and cooperative stop event
+    # 运行状态与协作停止事件
     task_running = False
     current_stop_event = None
 
     def append_log_msg(msg: str) -> None:
-        # Called from main thread: also put into queue for consistency
+        # 从主线程调用：也放入队列以保持一致性
         logs_queue.put(msg)
 
     def drain_logs() -> None:
@@ -238,7 +242,7 @@ def create_gui_pyqt(config_path: str) -> None:
         try:
             while True:
                 msg = logs_queue.get_nowait()
-                # try to parse JSON messages and display friendly summaries for users
+                # 尝试解析 JSON 消息并为用户显示友好摘要
                 try:
                     parsed = json.loads(msg)
                     if isinstance(parsed, dict):
@@ -256,6 +260,7 @@ def create_gui_pyqt(config_path: str) -> None:
                             else:
                                 summary = f"正在执行子任务: {parsed.get('task_name','')} · 区域: {parsed.get('area','')} · 提供商: {PROVIDER_DISPLAY.get(parsed.get('provider'), parsed.get('provider',''))}"
                             logs.append(summary)
+                            
                             continue
                         if ttype == 'subtask_done':
                             summary = f"子任务完成: {parsed.get('task_name','')} · 已处理: {parsed.get('count',0)} 条（{parsed.get('province','')}{parsed.get('city','')}{parsed.get('county','')}）"
@@ -275,18 +280,21 @@ def create_gui_pyqt(config_path: str) -> None:
                             except Exception:
                                 provider_name = provider
                             # 简短显示：提供商 · 关键词 · 页码
-                            logs.append(f"{provider_name} · {keyword} · 第 {pg} 页")
+                            # logs.append(f"{provider_name} · {keyword} · 第 {pg} 页")
                             continue
                         if ttype == 'summary_title':
                             # 三行摘要的第一行：标题
-                            logs.append(parsed.get('message', ''))
+                            # logs.append(parsed.get('message', ''))
                             continue
                         if ttype == 'summary_query':
                             # 三行摘要的第二行：查询/子任务信息
-                            logs.append(parsed.get('message', ''))
+                            # logs.append(parsed.get('message', ''))
                             continue
                         if ttype == 'summary_status':
                             # 三行摘要的第三行：状态/数量/错误
+                            # logs.append(parsed.get('message', ''))
+                            continue
+                        if ttype == 'message':
                             logs.append(parsed.get('message', ''))
                             continue
                         if ttype == 'task_done':
@@ -298,7 +306,7 @@ def create_gui_pyqt(config_path: str) -> None:
                             logs.append(summary)
                             continue
                         if ttype == 'runner_done':
-                            # background runner finished or stopped; restore UI state
+                            # 后台运行器完成或停止；恢复 UI 状态
                             task_running = False
                             current_stop_event = None
                             try:
@@ -309,7 +317,7 @@ def create_gui_pyqt(config_path: str) -> None:
                                 pass
                             logs.append("任务已停止或完成。")
                             continue
-                        # fallback: if it looks like a final log entry
+                        # 回退：若看起来像最终日志条目
                         if parsed.get('task_name') and parsed.get('status'):
                             summary = f"{parsed.get('run_time','')} | 任务: {parsed.get('task_name','')} | 状态: {parsed.get('status','')} | 记录: {parsed.get('records','')} | {parsed.get('message','') }"
                             logs.append(summary)
@@ -324,8 +332,8 @@ def create_gui_pyqt(config_path: str) -> None:
     timer.timeout.connect(drain_logs)
     timer.start(300)
 
-    # --- Log Query tab: build UI elements but add to tab widget later ---
-    # Filters
+    # --- 日志查询选项卡：构建 UI 元素（稍后加入选项卡） ---
+    # 过滤器
     log_date_from = QtWidgets.QDateEdit(); log_date_from.setCalendarPopup(True); log_date_from.setDate(QtCore.QDate.currentDate())
     log_date_to = QtWidgets.QDateEdit(); log_date_to.setCalendarPopup(True); log_date_to.setDate(QtCore.QDate.currentDate())
     log_task_filter = QtWidgets.QComboBox(); log_task_filter.addItem("全部")
@@ -333,7 +341,7 @@ def create_gui_pyqt(config_path: str) -> None:
     btn_query_logs = QtWidgets.QPushButton("查询日志")
     btn_export_filtered = QtWidgets.QPushButton("导出筛选结果")
     btn_export_all_logs = QtWidgets.QPushButton("导出全部日志")
-    # Table
+    # 表格
     log_table = QtWidgets.QTableWidget();
     log_table.setColumnCount(7)
     log_table.setHorizontalHeaderLabels(["任务名称", "运行时间", "区域", "提供商", "状态", "记录数", "消息"])
@@ -343,9 +351,16 @@ def create_gui_pyqt(config_path: str) -> None:
     def refresh_task_list() -> None:
         task_list.clear()
         for t in current_cfg.get("tasks", []):
-            text = f"{t.get('name')} | {get_task_area_summary(t)}"
+            name = t.get('name')
+            text = name if name else get_task_area_summary(t)
             item = QtWidgets.QListWidgetItem(text)
-            # make item checkbox-enabled for easy multi-selection
+            # 设置提示以显示区域摘要，便于查看
+            try:
+                item.setToolTip(get_task_area_summary(t))
+            except Exception:
+                pass
+            # 项目默认保持未勾选；加载任务时会恢复地区选择
+            # 启用复选框以方便多选
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.Unchecked)
             task_list.addItem(item)
@@ -382,35 +397,175 @@ def create_gui_pyqt(config_path: str) -> None:
                         city_item.setCheckState(0, QtCore.Qt.Unchecked)
                         prov_item.addChild(city_item)
                         if isinstance(counties, list):
-                            for c in counties:
-                                cname = c.get("name") if isinstance(c, dict) else str(c)
-                                county_item = QtWidgets.QTreeWidgetItem([cname])
-                                county_item.setFlags(county_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                                county_item.setCheckState(0, QtCore.Qt.Unchecked)
-                                city_item.addChild(county_item)
+                            if counties:
+                                for c in counties:
+                                    cname = None
+                                    try:
+                                        if isinstance(c, dict):
+                                            cname = c.get("name")
+                                        elif isinstance(c, str):
+                                            # 有些缓存会将 dict 字符串化存储；尝试安全解析
+                                            try:
+                                                parsed = ast.literal_eval(c)
+                                                if isinstance(parsed, dict):
+                                                    cname = parsed.get('name')
+                                            except Exception:
+                                                cname = str(c)
+                                        else:
+                                            cname = str(c)
+                                    except Exception:
+                                        cname = str(c)
+                                    county_item = QtWidgets.QTreeWidgetItem([cname])
+                                    county_item.setFlags(county_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                                    county_item.setCheckState(0, QtCore.Qt.Unchecked)
+                                    city_item.addChild(county_item)
+                                # 标记为已加载，避免懒加载时重复添加子节点
+                                try:
+                                    city_item.setData(0, QtCore.Qt.UserRole, 'loaded')
+                                except Exception:
+                                    pass
+                            else:
+                                # 无明确县列表：添加表示整个城市的占位项
+                                ph = QtWidgets.QTreeWidgetItem(["全部"])
+                                ph.setFlags(ph.flags() | QtCore.Qt.ItemIsUserCheckable)
+                                ph.setCheckState(0, QtCore.Qt.Unchecked)
+                                city_item.addChild(ph)
                 elif isinstance(cities, list):
                     for city in cities:
                         city_item = QtWidgets.QTreeWidgetItem([str(city)])
                         city_item.setFlags(city_item.flags() | QtCore.Qt.ItemIsUserCheckable)
                         city_item.setCheckState(0, QtCore.Qt.Unchecked)
                         prov_item.addChild(city_item)
+                        # 添加占位县节点，确保树为三层结构
+                        ph = QtWidgets.QTreeWidgetItem(["全部"])
+                        ph.setFlags(ph.flags() | QtCore.Qt.ItemIsUserCheckable)
+                        ph.setCheckState(0, QtCore.Qt.Unchecked)
+                        city_item.addChild(ph)
+        except Exception:
+            pass
 
     def populate_resources_tree():
         try:
             resources_tree.clear()
-            keys = list(current_cfg.get("keywords", {}).keys())
-            if not keys:
-                keys = ["gas_station", "service_area", "hospital", "repair_factory"]
-            for k in keys:
-                item = QtWidgets.QTreeWidgetItem([k])
-                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                item.setCheckState(0, QtCore.Qt.Unchecked)
-                resources_tree.addTopLevelItem(item)
+            # 确定所选提供商的内部键名
+            try:
+                prov_display = provider_combo.currentText()
+                prov_key = provider_display_to_value.get(prov_display, current_cfg.get("provider", "gaode"))
+            except Exception:
+                prov_key = current_cfg.get("provider", "gaode")
+            # candidate path: same dir as config_edit
+            import os
+            cfg_dir = os.path.dirname(config_edit.text()) or "config"
+            tree_path = os.path.join(cfg_dir, f"data_type_tree.{prov_key}.json")
+            data = None
+            try:
+                with open(tree_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+            # 回退：尝试工作区的 config 目录
+            if data is None:
+                try:
+                    tree_path = os.path.join('config', f"data_type_tree.{prov_key}.json")
+                    with open(tree_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = None
+
+            # 辅助：从 data_type_tree 使用的嵌套 dict 格式构建节点
+            def add_node(parent, key, node):
+                try:
+                    it = QtWidgets.QTreeWidgetItem([key])
+                    it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                    it.setCheckState(0, QtCore.Qt.Unchecked)
+                    # 若存在则附加提供商特定的编码
+                    try:
+                        code = None
+                        if isinstance(node, dict):
+                            code = node.get('code') or node.get('id')
+                        if code is not None:
+                            it.setData(0, QtCore.Qt.UserRole, str(code))
+                    except Exception:
+                        pass
+                    parent.addChild(it)
+                    # 子项可能位于 'children' 字段下
+                    ch = node.get('children') if isinstance(node, dict) else None
+                    if isinstance(ch, dict):
+                        for subk, subv in ch.items():
+                            add_node(it, subk, subv if isinstance(subv, dict) else {})
+                except Exception:
+                    pass
+
+            # 填充资源树
+            if isinstance(data, dict):
+                # top-level keys
+                for k, v in data.items():
+                    try:
+                        top = QtWidgets.QTreeWidgetItem([k])
+                        top.setFlags(top.flags() | QtCore.Qt.ItemIsUserCheckable)
+                        top.setCheckState(0, QtCore.Qt.Unchecked)
+                        # 顶层编码
+                        try:
+                            code = None
+                            if isinstance(v, dict):
+                                code = v.get('code') or v.get('id')
+                            if code is not None:
+                                top.setData(0, QtCore.Qt.UserRole, str(code))
+                        except Exception:
+                            pass
+                        resources_tree.addTopLevelItem(top)
+                        # 子项
+                        ch = v.get('children') if isinstance(v, dict) else None
+                        if isinstance(ch, dict):
+                            for subk, subv in ch.items():
+                                add_node(top, subk, subv if isinstance(subv, dict) else {})
+                    except Exception:
+                        pass
+            else:
+                # 回退：使用配置中的关键字填充
+                keys = list(current_cfg.get("keywords", {}).keys())
+                if not keys:
+                    keys = ["gas_station", "service_area", "hospital", "repair_factory"]
+                for k in keys:
+                    item = QtWidgets.QTreeWidgetItem([k])
+                    item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                    item.setCheckState(0, QtCore.Qt.Unchecked)
+                    resources_tree.addTopLevelItem(item)
+
+            # 从配置恢复勾选状态
+            try:
+                cfg_res = current_cfg.get("resources", []) or []
+                # 对 cfg_res 中出现的节点文本递归设置勾选
+                try:
+                    setattr(resources_tree, '_updating', True)
+                except Exception:
+                    pass
+                def set_checked_from_cfg(node):
+                    try:
+                        if node.text(0) in cfg_res:
+                            node.setCheckState(0, QtCore.Qt.Checked)
+                    except Exception:
+                        pass
+                    for j in range(node.childCount()):
+                        set_checked_from_cfg(node.child(j))
+                for i in range(resources_tree.topLevelItemCount()):
+                    set_checked_from_cfg(resources_tree.topLevelItem(i))
+                try:
+                    setattr(resources_tree, '_updating', False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception:
             pass
 
-    def propagate_check(item: QtWidgets.QTreeWidgetItem, col: int) -> None:
+    def propagate_check(item, col):
+        tw = item.treeWidget()
+        # prevent re-entrant signal handling when we programmatically change states
+        if getattr(tw, '_updating', False):
+            return
         try:
+            tw._updating = True
             state = item.checkState(col)
             # set all children to the same state
             def set_children(it):
@@ -419,7 +574,7 @@ def create_gui_pyqt(config_path: str) -> None:
                     ch.setCheckState(0, state)
                     set_children(ch)
             set_children(item)
-            # propagate upwards
+            # propagate upwards without causing children to be re-toggled
             parent = item.parent()
             while parent is not None:
                 all_checked = True
@@ -439,11 +594,127 @@ def create_gui_pyqt(config_path: str) -> None:
                 parent = parent.parent()
         except Exception:
             pass
+        finally:
+            try:
+                tw._updating = False
+            except Exception:
+                pass
 
-    # wire tree signals
+    # 绑定树的信号处理（父子节点勾选联动）
     try:
         region_tree.itemChanged.connect(propagate_check)
         resources_tree.itemChanged.connect(propagate_check)
+    except Exception:
+        pass
+
+    def toggle_task_select_all():
+        # 切换任务列表中项目的勾选状态：若存在未勾选 -> 全选，否则全不选
+        try:
+            any_unchecked = False
+            for i in range(task_list.count()):
+                it = task_list.item(i)
+                if it.checkState() != QtCore.Qt.Checked:
+                    any_unchecked = True
+                    break
+            target = QtCore.Qt.Checked if any_unchecked else QtCore.Qt.Unchecked
+            for i in range(task_list.count()):
+                it = task_list.item(i)
+                try:
+                    it.setCheckState(target)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def on_region_item_expanded(item) -> None:
+        """当城市节点被展开时，按需（懒加载）加载其下属区/县（若尚未加载）。"""
+        try:
+            # only proceed if this looks like a city (has a parent which is a province)
+            parent = item.parent()
+            if parent is None:
+                return
+            # already loaded marker
+            if item.data(0, QtCore.Qt.UserRole) == 'loaded':
+                return
+            prov = parent.text(0)
+            cit = item.text(0)
+            gaode_key = current_cfg.get("api_keys", {}).get("gaode", "")
+            subs = []
+            try:
+                subs = fetch_amap_subdistrict(gaode_key, prov, cit)
+            except Exception:
+                subs = []
+            if not subs:
+                # mark as loaded to avoid repeated attempts
+                item.setData(0, QtCore.Qt.UserRole, 'loaded')
+                return
+            # add children nodes for counties (remove placeholder children first to avoid duplicates)
+            tw = item.treeWidget()
+            setattr(tw, '_updating', True)
+            try:
+                # clear existing children (e.g., placeholder "全部")
+                while item.childCount() > 0:
+                    item.removeChild(item.child(0))
+                for c in subs:
+                    cname = c.get('name') if isinstance(c, dict) else str(c)
+                    if not cname:
+                        continue
+                    county_item = QtWidgets.QTreeWidgetItem([cname])
+                    county_item.setFlags(county_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                    county_item.setCheckState(0, QtCore.Qt.Unchecked)
+                    item.addChild(county_item)
+                item.setData(0, QtCore.Qt.UserRole, 'loaded')
+            finally:
+                try:
+                    setattr(tw, '_updating', False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        region_tree.itemExpanded.connect(on_region_item_expanded)
+    except Exception:
+        pass
+
+    def update_selected_provinces():
+        """从高德拉取指定省份的区域层次，并仅将这些省份合并到本地缓存中。
+
+        该操作仅在用户手动点击“更新行政区”按钮时触发，避免程序启动时的自动联网。
+        """
+        gaode_key = current_cfg.get("api_keys", {}).get("gaode", "")
+        if not gaode_key:
+            append_log_msg("未配置高德 key，无法更新行政区。")
+            return
+        target = ["北京市", "天津市", "河北省", "山西省", "陕西省", "河南省", "湖北省"]
+
+        def worker():
+            try:
+                # explicitly fetch from AMap (only on user action)
+                fetched = fetch_and_save_region_hierarchy(cfg_path, gaode_key, target)
+            except Exception:
+                fetched = {}
+            # fetched is normalized {prov: {city: [counties]}}, merge selected provinces
+            updated = False
+            for prov in target:
+                if prov in fetched and fetched.get(prov):
+                    region_data.setdefault(prov, {})
+                    region_data[prov].update(fetched.get(prov))
+                    updated = True
+            if updated:
+                # schedule UI update on main thread
+                try:
+                    QtCore.QTimer.singleShot(0, populate_region_tree)
+                except Exception:
+                    pass
+                append_log_msg("已更新指定省份行政区并保存到缓存。")
+            else:
+                append_log_msg("未获取到目标省份数据。")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    try:
+        btn_update_regions.clicked.connect(update_selected_provinces)
     except Exception:
         pass
 
@@ -549,41 +820,55 @@ def create_gui_pyqt(config_path: str) -> None:
             append_log_msg(f"导出日志失败: {exc}")
 
     def update_provinces():
-        province_combo.clear(); province_combo.addItems(sorted(region_data.keys()))
+        """重新加载配置与区域缓存并重建地区树。
+
+        确保每次用户刷新配置时，GUI 使用本地缓存（`region_cache.json` 或其归一化回退）
+        来生成树结构，避免在界面刷新时发起网络请求。
+        """
+        nonlocal current_cfg, region_data, cfg_path
+        try:
+            cfg_path = config_edit.text()
+        except Exception:
+            pass
+        # reload config if possible
+        try:
+            current_cfg = config_loader.load_config(cfg_path)
+        except Exception:
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    current_cfg = json.load(f)
+            except Exception:
+                current_cfg = current_cfg
+        # normalize/merge cache keys first, then rebuild region_data from cache (no network fetch)
+        try:
+            try:
+                merged = unify_region_cache(cfg_path)
+                region_data = merged or ensure_region_data(cfg_path, current_cfg.get("api_keys", {}).get("gaode", ""))
+            except Exception:
+                region_data = ensure_region_data(cfg_path, current_cfg.get("api_keys", {}).get("gaode", ""))
+        except Exception:
+            try:
+                # fallback: try direct load of region_cache
+                region_data = load_region_cache(get_region_cache_path(cfg_path)) or {}
+            except Exception:
+                region_data = {}
+        # refresh task list (in case tasks changed) and UI tree
+        try:
+            refresh_task_list()
+        except Exception:
+            pass
+        try:
+            populate_region_tree()
+        except Exception:
+            pass
 
     def update_cities():
-        prov = province_combo.currentText()
-        city_combo.clear()
-        if prov and prov in region_data:
-            # add '全部' option to allow fetching entire province/city
-            city_combo.addItem("全部")
-            city_combo.addItems(sorted(region_data[prov].keys()))
+        # stub: no-op since per-task single-selection removed
+        return
 
     def update_counties():
-        prov = province_combo.currentText(); cit = city_combo.currentText()
-        county_combo.clear()
-        # if user selected '全部' for city, show only '全部' to represent whole-city fetch
-        if prov and cit == "全部" and prov in region_data:
-            county_combo.addItem("全部")
-            return
-        if prov and cit and prov in region_data and cit in region_data[prov]:
-            counties = region_data[prov][cit]
-            if not counties:
-                # try fetch
-                fetched = fetch_amap_subdistrict(current_cfg.get("api_keys", {}).get("gaode", ""), prov, cit)
-                if fetched:
-                    region_data.setdefault(prov, {})[cit] = fetched
-                    counties = fetched
-            # add '全部' option to allow fetching entire city when desired
-            county_combo.addItem("全部")
-            # region_data entries may be dicts with name/adcode or plain names
-            names = []
-            for c in (counties or []):
-                if isinstance(c, dict):
-                    names.append(c.get("name", ""))
-                else:
-                    names.append(str(c))
-            county_combo.addItems([n for n in names if n])
+        # stub: no-op since per-task single-selection removed
+        return
 
     selected_task_index = None
 
@@ -596,32 +881,6 @@ def create_gui_pyqt(config_path: str) -> None:
         # map stored internal value ('admin'/'bbox') to display text
         stored_atype = t.get("area_type", "admin")
         area_type_combo.setCurrentText(type_value_to_display.get(stored_atype, stored_atype))
-        province_combo.setCurrentText(t.get("admin_region", {}).get("province", ""))
-        update_cities()
-        # map empty-string (saved meaning '全部') to display value '全部'
-        city_val = t.get("admin_region", {}).get("city", "") or "全部"
-        city_combo.setCurrentText(city_val)
-        update_counties()
-        county_val = t.get("admin_region", {}).get("county", "") or "全部"
-        # if stored config only has adcode, try to map to name
-        if county_val == "" and t.get("admin_region", {}).get("adcode"):
-            ac = t.get("admin_region", {}).get("adcode")
-            # try lookup
-            try:
-                prov = t.get("admin_region", {}).get("province", "")
-                cit = t.get("admin_region", {}).get("city", "")
-                if prov and cit and prov in region_data and cit in region_data[prov]:
-                    for entry in region_data[prov][cit]:
-                        if isinstance(entry, dict) and str(entry.get("adcode")) == str(ac):
-                            county_val = entry.get("name", "")
-                            break
-            except Exception:
-                pass
-        county_combo.setCurrentText(county_val)
-        bbox_left.setText(str((t.get("bbox") or {}).get("left", "")))
-        bbox_bottom.setText(str((t.get("bbox") or {}).get("bottom", "")))
-        bbox_right.setText(str((t.get("bbox") or {}).get("right", "")))
-        bbox_top.setText(str((t.get("bbox") or {}).get("top", "")))
         # update enabled/disabled widgets based on loaded mode
         try:
             update_mode_ui()
@@ -631,6 +890,227 @@ def create_gui_pyqt(config_path: str) -> None:
         # record which task index is currently loaded in the editor
         nonlocal selected_task_index
         selected_task_index = idx
+        # restore selected regions (admin_regions or admin_region)
+        try:
+            regions = t.get("admin_regions") or ([t.get("admin_region")] if t.get("admin_region") else [])
+            # normalize list of dicts
+            normr = []
+            for r in regions:
+                if not isinstance(r, dict):
+                    continue
+                pr = (r.get("province") or "").strip()
+                ci = (r.get("city") or "").strip()
+                co = (r.get("county") or "").strip()
+                normr.append((pr, ci, co))
+            try:
+                setattr(region_tree, '_updating', True)
+            except Exception:
+                pass
+
+            # clear all checks first
+            def clear_checks(node):
+                try:
+                    node.setCheckState(0, QtCore.Qt.Unchecked)
+                except Exception:
+                    pass
+                for i in range(node.childCount()):
+                    clear_checks(node.child(i))
+
+            for i in range(region_tree.topLevelItemCount()):
+                clear_checks(region_tree.topLevelItem(i))
+
+            # helper to find and check node by path
+            def normalize_region_name(s: str) -> str:
+                try:
+                    if s is None:
+                        return ""
+                    x = str(s).strip()
+                    # remove common administrative suffixes for fuzzy matching
+                    for suf in ["省", "市", "自治区", "特别行政区", "自治州", "地区", "区", "县", "市辖区"]:
+                        if x.endswith(suf):
+                            x = x[: -len(suf)]
+                    return x.strip().lower()
+                except Exception:
+                    return (s or "").strip().lower()
+
+            def check_path(path_tuple):
+                pr, ci, co = path_tuple
+                npr = normalize_region_name(pr)
+                nci = normalize_region_name(ci)
+                nco = normalize_region_name(co)
+                for pi in range(region_tree.topLevelItemCount()):
+                    pitem = region_tree.topLevelItem(pi)
+                    if normalize_region_name(pitem.text(0)) != npr:
+                        continue
+                    # province matched
+                    # if city is empty or explicitly '全部', check whole province
+                    if not ci or (isinstance(ci, str) and ci.strip() == '全部'):
+                        pitem.setCheckState(0, QtCore.Qt.Checked)
+                        return
+                    # find city
+                    for ci_idx in range(pitem.childCount()):
+                        city_item = pitem.child(ci_idx)
+                        if normalize_region_name(city_item.text(0)) != nci:
+                            continue
+                        # city matched
+                        # if county is empty or explicitly '全部', check whole city
+                        if not co or (isinstance(co, str) and co.strip() == '全部'):
+                            city_item.setCheckState(0, QtCore.Qt.Checked)
+                            return
+                        # find county
+                        for co_idx in range(city_item.childCount()):
+                            county_item = city_item.child(co_idx)
+                            if normalize_region_name(county_item.text(0)) == nco:
+                                county_item.setCheckState(0, QtCore.Qt.Checked)
+                                return
+                        # if county not found, mark city as checked if county unspecified
+                        return
+
+            for p in normr:
+                if p[0]:
+                    check_path(p)
+
+            # derive parent partial states from children
+            def derive_parent(node):
+                try:
+                    if node.childCount() == 0:
+                        return node.checkState(0) == QtCore.Qt.Checked
+                    all_checked = True
+                    any_checked = False
+                    for j in range(node.childCount()):
+                        ch = node.child(j)
+                        child_checked = derive_parent(ch)
+                        if child_checked:
+                            any_checked = True
+                        else:
+                            all_checked = False
+                    if all_checked:
+                        node.setCheckState(0, QtCore.Qt.Checked)
+                        return True
+                    if any_checked:
+                        node.setCheckState(0, QtCore.Qt.PartiallyChecked)
+                        return True
+                    node.setCheckState(0, QtCore.Qt.Unchecked)
+                    return False
+                except Exception:
+                    return False
+
+            for i in range(region_tree.topLevelItemCount()):
+                try:
+                    derive_parent(region_tree.topLevelItem(i))
+                except Exception:
+                    pass
+
+            try:
+                setattr(region_tree, '_updating', False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # restore provider and resources to task editor
+        try:
+            prov = t.get("provider") or current_cfg.get("provider")
+            if prov:
+                try:
+                    provider_combo.setCurrentText(provider_value_to_display.get(prov, provider_combo.currentText()))
+                except Exception:
+                    pass
+            # repopulate resources tree for this provider
+            try:
+                populate_resources_tree()
+            except Exception:
+                pass
+            # check resources according to task (match any tree node by text recursively)
+            try:
+                task_res = t.get("resources", []) or []
+                try:
+                    setattr(resources_tree, '_updating', True)
+                except Exception:
+                    pass
+                def norm(s):
+                    try:
+                        return (s or "").strip().replace('\ufeff', '')
+                    except Exception:
+                        return s
+
+                def set_checked_from_task(node):
+                    # set children first
+                    for j in range(node.childCount()):
+                        set_checked_from_task(node.child(j))
+                    # if leaf, check if in task_res
+                    try:
+                        if node.childCount() == 0:
+                            # determine whether task_res items are codes or names for this provider
+                            try:
+                                tprov = t.get("provider") or current_cfg.get("provider")
+                            except Exception:
+                                tprov = current_cfg.get("provider")
+                            use_code = tprov in ("gaode", "tianditu")
+                            node_code = None
+                            try:
+                                node_code = node.data(0, QtCore.Qt.UserRole)
+                            except Exception:
+                                node_code = None
+                            if use_code and node_code is not None:
+                                if norm(str(node_code)) in [norm(x) for x in task_res]:
+                                    node.setCheckState(0, QtCore.Qt.Checked)
+                                else:
+                                    node.setCheckState(0, QtCore.Qt.Unchecked)
+                            elif tprov == "baidu":
+                                # task_res expected as list of dicts {'query':..., 'type':...} or legacy names
+                                try:
+                                    pairs = []
+                                    for it in task_res:
+                                        if isinstance(it, dict):
+                                            pairs.append((norm(it.get('query','')), norm(it.get('type',''))))
+                                        else:
+                                            # legacy single-name entries: match child name
+                                            pairs.append(("", norm(str(it))))
+                                    parent = node.parent()
+                                    pnorm = norm(parent.text(0)) if parent is not None else ""
+                                    lnorm = norm(node.text(0))
+                                    if (pnorm, lnorm) in pairs or ("", lnorm) in pairs:
+                                        node.setCheckState(0, QtCore.Qt.Checked)
+                                    else:
+                                        node.setCheckState(0, QtCore.Qt.Unchecked)
+                                except Exception:
+                                    if norm(node.text(0)) in [norm(x) for x in task_res]:
+                                        node.setCheckState(0, QtCore.Qt.Checked)
+                                    else:
+                                        node.setCheckState(0, QtCore.Qt.Unchecked)
+                            else:
+                                if norm(node.text(0)) in [norm(x) for x in task_res]:
+                                    node.setCheckState(0, QtCore.Qt.Checked)
+                                else:
+                                    node.setCheckState(0, QtCore.Qt.Unchecked)
+                        else:
+                            # non-leaf: derive state from children
+                            all_checked = True
+                            any_checked = False
+                            for k in range(node.childCount()):
+                                s = node.child(k).checkState(0)
+                                if s == QtCore.Qt.Checked:
+                                    any_checked = True
+                                else:
+                                    all_checked = False
+                            if all_checked:
+                                node.setCheckState(0, QtCore.Qt.Checked)
+                            elif any_checked:
+                                node.setCheckState(0, QtCore.Qt.PartiallyChecked)
+                            else:
+                                node.setCheckState(0, QtCore.Qt.Unchecked)
+                    except Exception:
+                        pass
+                for i in range(resources_tree.topLevelItemCount()):
+                    set_checked_from_task(resources_tree.topLevelItem(i))
+                try:
+                    setattr(resources_tree, '_updating', False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def on_task_selected():
         idx = task_list.currentRow()
@@ -643,29 +1123,23 @@ def create_gui_pyqt(config_path: str) -> None:
         # write global settings into current_cfg and save
         try:
             # map displayed provider name back to internal key
-            cur_prov_display = provider_combo.currentText()
-            current_cfg["provider"] = provider_display_to_value.get(cur_prov_display, cur_prov_display)
-            # resources: accept JSON list or comma/Chinese-comma separated keywords
-            raw = resources_edit.text().strip()
             try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    current_cfg["resources"] = [str(x).strip() for x in parsed if str(x).strip()]
-                else:
-                    raise ValueError("not a list")
+                sched_cfg = current_cfg.setdefault("scheduler", {})
+                sched_cfg["check_interval_minutes"] = int(check_interval_spin.value())
             except Exception:
-                parts = [p.strip() for p in re.split(r"[,，]", raw) if p.strip()]
-                current_cfg["resources"] = parts
-            current_cfg["export_format"] = export_combo.currentText()
-            current_cfg["province_expand_concurrency"] = int(province_expand_concurrency_spin.value())
-            current_cfg["province_expand_delay_seconds"] = float(province_expand_delay_spin.value())
-            current_cfg["default_page_limit"] = int(page_spin.value())
-            # scheduler settings are nested under 'scheduler'
-            sched = current_cfg.setdefault("scheduler", {})
-            sched["check_interval_minutes"] = int(check_interval_spin.value())
+                current_cfg.setdefault("scheduler", {})
             current_cfg["incremental"] = bool(incr_check.isChecked())
-            current_cfg["schedule_interval_days"] = int(sched_spin.value())
+            try:
+                current_cfg["schedule_interval_days"] = int(sched_spin.value())
+            except Exception:
+                current_cfg["schedule_interval_days"] = int(current_cfg.get("schedule_interval_days", 1))
             current_cfg["max_concurrency"] = int(concurrency_spin.value())
+            # resources are per-task now; do not save them as global here
+            # ensure export format saved globally
+            try:
+                current_cfg["export_format"] = export_combo.currentText()
+            except Exception:
+                pass
             config_loader.save_config(config_edit.text(), current_cfg)
             # recreate executor if changed
             try:
@@ -674,6 +1148,7 @@ def create_gui_pyqt(config_path: str) -> None:
                     try:
                         executor.shutdown(wait=False)
                     except Exception:
+                # single-selection admin dropdowns removed; bbox fields preserved
                         pass
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=new_max)
             except Exception:
@@ -698,45 +1173,130 @@ def create_gui_pyqt(config_path: str) -> None:
             task: Dict[str, Any] = {"name": name, "enabled": True, "area_type": atype}
             if atype == "bbox":
                 task["bbox"] = {"left": float(bbox_left.text() or 0), "bottom": float(bbox_bottom.text() or 0), "right": float(bbox_right.text() or 0), "top": float(bbox_top.text() or 0)}
-                task["admin_region"] = {"country": country_label.text(), "province": "", "city": ""}
             else:
-                # map UI '全部' selection to empty string in saved config to indicate whole-city/whole-province
-                prov = province_combo.currentText()
-                city = city_combo.currentText()
-                county = county_combo.currentText()
-                if city == "全部":
-                    city = ""
-                if county == "全部":
-                    county = ""
-                admin = {"country": country_label.text(), "province": prov, "city": city, "county": county}
-                # if we have region_data with adcodes, try to attach adcode for precise queries
-                try:
-                    if prov and city and prov in region_data and city in region_data[prov]:
-                        entries = region_data[prov][city]
-                        if entries:
-                            for entry in entries:
-                                name = entry.get("name") if isinstance(entry, dict) else entry
-                                if name == county and isinstance(entry, dict):
-                                    admin["adcode"] = entry.get("adcode", "")
-                                    break
-                except Exception:
-                    pass
-                task["admin_region"] = admin
+                # single-selection dropdowns removed; admin will be set from region_tree selection
+                admin = {"country": country_label.text(), "province": "", "city": "", "county": ""}
+                # admin regions will be stored in 'admin_regions' only
                 task["bbox"] = None
-            # collect selected resources from resources_tree if any, else parse resources_edit
-            sel_resources = []
+            # per-task provider
             try:
-                for i in range(resources_tree.topLevelItemCount()):
-                    it = resources_tree.topLevelItem(i)
-                    if it.checkState(0) == QtCore.Qt.Checked:
-                        sel_resources.append(it.text(0))
+                prov_disp = provider_combo.currentText()
+                prov_key = provider_display_to_value.get(prov_disp, prov_disp)
+                task["provider"] = prov_key
             except Exception:
                 pass
-            if not sel_resources:
-                try:
-                    sel_resources = json.loads(resources_edit.text()) if resources_edit.text() else []
-                except Exception:
-                    sel_resources = [p.strip() for p in re.split(r"[,，]", resources_edit.text()) if p.strip()]
+            # collect selected resources from resources_tree as final-level (leaf) nodes
+            sel_resources = []
+            try:
+                def norm(s):
+                    try:
+                        return (s or "").strip().replace('\ufeff', '')
+                    except Exception:
+                        return s
+
+                def collect_res_leaves(node):
+                    out = []
+                    if node.childCount() == 0:
+                        if node.checkState(0) == QtCore.Qt.Checked:
+                            # for providers with codes, prefer storing the code
+                            try:
+                                prov_disp_local = provider_combo.currentText()
+                                prov_key_local = provider_display_to_value.get(prov_disp_local, prov_disp_local)
+                                use_code = prov_key_local in ("gaode", "tianditu")
+                            except Exception:
+                                use_code = False
+                            try:
+                                node_code = node.data(0, QtCore.Qt.UserRole)
+                            except Exception:
+                                node_code = None
+                            if use_code and node_code:
+                                out.append(norm(node_code))
+                            else:
+                                out.append(norm(node.text(0)))
+                    else:
+                        for j in range(node.childCount()):
+                            out.extend(collect_res_leaves(node.child(j)))
+                    return out
+
+                for i in range(resources_tree.topLevelItemCount()):
+                    root = resources_tree.topLevelItem(i)
+                    sel_resources.extend(collect_res_leaves(root))
+                # dedupe while preserving order
+                seen = set(); uniq = []
+                for r in sel_resources:
+                    if r not in seen:
+                        seen.add(r); uniq.append(r)
+                sel_resources = uniq
+            except Exception:
+                sel_resources = []
+            # Provider-specific storage: gaode/tianditu store codes, baidu store {query,type}
+            try:
+                prov = task.get("provider") or current_cfg.get("provider", "gaode")
+                if prov in ("gaode", "tianditu"):
+                    # collect codes for leaf nodes
+                    codes = []
+                    for i in range(resources_tree.topLevelItemCount()):
+                        def collect_codes(node):
+                            out = []
+                            if node.childCount() == 0:
+                                code = node.data(0, QtCore.Qt.UserRole)
+                                name = node.text(0)
+                                if code:
+                                    out.append(str(code))
+                                else:
+                                    out.append(norm(name))
+                            else:
+                                for j in range(node.childCount()):
+                                    out.extend(collect_codes(node.child(j)))
+                            return out
+                        codes.extend(collect_codes(resources_tree.topLevelItem(i)))
+                    # dedupe
+                    seen = set(); uniq_codes = []
+                    for c in codes:
+                        if c not in seen:
+                            seen.add(c); uniq_codes.append(c)
+                    task["resources"] = uniq_codes
+                elif prov == "baidu":
+                    # store parent->child pairs as {'query': parent, 'type': child}
+                    pairs = []
+                    for i in range(resources_tree.topLevelItemCount()):
+                        def collect_pairs(node):
+                            out = []
+                            if node.childCount() == 0:
+                                parent = node.parent()
+                                if parent is not None:
+                                    out.append({"query": norm(parent.text(0)), "type": norm(node.text(0))})
+                                else:
+                                    out.append({"query": "", "type": norm(node.text(0))})
+                            else:
+                                for j in range(node.childCount()):
+                                    out.extend(collect_pairs(node.child(j)))
+                            return out
+                        pairs.extend(collect_pairs(resources_tree.topLevelItem(i)))
+                    # filter by selected leaves only
+                    selected_pairs = []
+                    for p in pairs:
+                        # find node by parent/type and only include if checked
+                        try:
+                            # locate parent node
+                            for ii in range(resources_tree.topLevelItemCount()):
+                                top = resources_tree.topLevelItem(ii)
+                                for jj in range(top.childCount()):
+                                    par = top.child(jj)
+                                    if norm(par.text(0)) == p.get("query"):
+                                        for kk in range(par.childCount()):
+                                            child = par.child(kk)
+                                            if norm(child.text(0)) == p.get("type") and child.checkState(0) == QtCore.Qt.Checked:
+                                                selected_pairs.append(p)
+                        except Exception:
+                            pass
+                    task["resources"] = selected_pairs
+                else:
+                    task["resources"] = sel_resources
+            except Exception:
+                task["resources"] = sel_resources
+            except Exception:
+                sel_resources = []
             task["resources"] = sel_resources
             # collect selected regions from region_tree; if multiple regions selected, create multiple tasks
             selected_regions = []
@@ -786,29 +1346,150 @@ def create_gui_pyqt(config_path: str) -> None:
             except Exception:
                 selected_regions = []
 
-            tasks_to_add = []
-            if selected_regions:
-                for idx_r, reg in enumerate(selected_regions):
-                    tcopy = dict(task)
-                    tcopy["admin_region"] = reg
-                    # if multiple regions, append region text to name to disambiguate
-                    if len(selected_regions) > 1:
-                        tcopy["name"] = f"{tcopy['name']} ({reg.get('province','')}/{reg.get('city','')}/{reg.get('county','')})"
-                    tasks_to_add.append(tcopy)
-            else:
-                tasks_to_add.append(task)
-            # prefer the task index that was loaded into the editor; fall back to currentRow
-            nonlocal selected_task_index
-            idx = selected_task_index if selected_task_index is not None else task_list.currentRow()
-            tasks = current_cfg.setdefault("tasks", [])
-            if idx < 0:
-                tasks.extend(tasks_to_add)
-            else:
-                # replace the single selected row with first task, append remaining after it
-                tasks[idx] = tasks_to_add[0]
-                if len(tasks_to_add) > 1:
-                    for extra in tasks_to_add[1:]:
-                        tasks.insert(idx + 1, extra)
+            # consolidate selected regions into a single task using 'admin_regions'
+            try:
+                # expand any city-level "全部" to concrete counties before saving
+                def expand_city_all(regions_list):
+                    out = []
+                    gaode_key = current_cfg.get("api_keys", {}).get("gaode", "")
+                    # load region cache if available
+                    try:
+                        cache = load_region_cache(get_region_cache_path(config_edit.text()))
+                    except Exception:
+                        cache = {}
+                    def normalize(s):
+                        try:
+                            return (s or "").strip()
+                        except Exception:
+                            return s or ""
+
+                    for r in regions_list:
+                        pr = normalize(r.get("province"))
+                        ci = normalize(r.get("city"))
+                        co = normalize(r.get("county"))
+                        if co and co != "全部":
+                            out.append({"country": r.get("country"), "province": pr, "city": ci, "county": co})
+                            continue
+                        # county is empty or 全部 -> try to expand
+                        counties = []
+                        # try to find city node in region_tree
+                        try:
+                            found = False
+                            for pi in range(region_tree.topLevelItemCount()):
+                                pitem = region_tree.topLevelItem(pi)
+                                if normalize(pitem.text(0)) != pr:
+                                    continue
+                                for ci_idx in range(pitem.childCount()):
+                                    city_item = pitem.child(ci_idx)
+                                    if normalize(city_item.text(0)) != ci:
+                                        continue
+                                    # found city node
+                                    found = True
+                                    # if children loaded and not just a placeholder, use them
+                                    if city_item.childCount() > 0:
+                                        names = []
+                                        for k in range(city_item.childCount()):
+                                            child = city_item.child(k)
+                                            cn = normalize(child.text(0))
+                                            if cn and cn != "全部":
+                                                names.append(child.text(0))
+                                        if names:
+                                            counties = names
+                                    break
+                                if found:
+                                    break
+                        except Exception:
+                            counties = []
+
+                        # fallback: from cache
+                        if not counties:
+                            try:
+                                if isinstance(cache, dict) and pr in cache and isinstance(cache.get(pr), dict) and ci in cache.get(pr):
+                                    val = cache.get(pr).get(ci, [])
+                                    counties = [x.get('name') if isinstance(x, dict) else str(x) for x in val if x]
+                            except Exception:
+                                counties = []
+
+                        # last resort: call AMap to fetch subdistricts
+                        if not counties and gaode_key and pr and ci:
+                            try:
+                                subs = fetch_amap_subdistrict(gaode_key, pr, ci)
+                                if subs:
+                                    counties = [d.get('name') if isinstance(d, dict) else str(d) for d in subs if d]
+                                    # persist into cache for future
+                                    try:
+                                        cache.setdefault(pr, {})
+                                        cache[pr].setdefault(ci, [])
+                                        cache[pr][ci] = subs
+                                        save_region_cache(get_region_cache_path(config_edit.text()), cache)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                counties = []
+
+                        if counties:
+                            for cc in counties:
+                                out.append({"country": r.get("country"), "province": pr, "city": ci, "county": cc})
+                        else:
+                            # unable to expand: keep a single entry with county as '全部' to preserve intent
+                            out.append({"country": r.get("country"), "province": pr, "city": ci, "county": "全部"})
+                    return out
+
+                if selected_regions:
+                    expanded = expand_city_all(selected_regions)
+                    task["admin_regions"] = expanded
+                else:
+                    task.pop("admin_regions", None)
+                nonlocal selected_task_index
+                idx = selected_task_index if selected_task_index is not None else task_list.currentRow()
+                tasks = current_cfg.setdefault("tasks", [])
+                if idx < 0:
+                    tasks.append(task)
+                else:
+                    # replace existing task at idx
+                    try:
+                        tasks[idx] = task
+                    except Exception:
+                        # fallback to append
+                        tasks.append(task)
+            except Exception:
+                pass
+            # 同步保存导出格式为全局设置（在保存任务时也保存该全局偏好）
+            try:
+                current_cfg["export_format"] = export_combo.currentText()
+            except Exception:
+                pass
+            # 若资源为提供商代码（如 gaode/tianditu），将其转换回中文显示名再保存
+            try:
+                prov = task.get("provider") or current_cfg.get("provider")
+                if prov in ("gaode", "tianditu"):
+                    def code_to_name(code_val: str) -> str:
+                        try:
+                            for i in range(resources_tree.topLevelItemCount()):
+                                top = resources_tree.topLevelItem(i)
+                                # traverse
+                                stack = [top]
+                                while stack:
+                                    node = stack.pop()
+                                    try:
+                                        if node.data(0, QtCore.Qt.UserRole) == code_val:
+                                            return node.text(0)
+                                    except Exception:
+                                        pass
+                                    for j in range(node.childCount()):
+                                        stack.append(node.child(j))
+                        except Exception:
+                            pass
+                        return code_val
+
+                    try:
+                        saved_res = task.get("resources", []) or []
+                        task["resources"] = [code_to_name(str(c)) for c in saved_res]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             config_loader.save_config(config_edit.text(), current_cfg)
             refresh_task_list()
             append_log_msg(f"已保存任务: {task['name']}")
@@ -816,6 +1497,8 @@ def create_gui_pyqt(config_path: str) -> None:
             append_log_msg(f"保存任务失败: {e}")
 
     def add_task_ui():
+        nonlocal selected_task_index
+        selected_task_index = -1
         task_name_edit.setText(f"新任务_{len(current_cfg.get('tasks', []))+1}")
 
     def delete_task_ui():
@@ -973,10 +1656,16 @@ def create_gui_pyqt(config_path: str) -> None:
 
     # wire signals
     task_list.currentRowChanged.connect(lambda _i: on_task_selected())
-    province_combo.currentIndexChanged.connect(lambda _i: update_cities())
-    city_combo.currentIndexChanged.connect(lambda _i: update_counties())
     area_type_combo.currentIndexChanged.connect(lambda _i: update_mode_ui())
-    btn_load.clicked.connect(lambda: (refresh_task_list(), update_provinces(), append_log_msg("已加载配置")))
+    try:
+        btn_select_tasks.clicked.connect(toggle_task_select_all)
+    except Exception:
+        pass
+    try:
+        provider_combo.currentIndexChanged.connect(lambda _i: populate_resources_tree())
+    except Exception:
+        pass
+    btn_load.clicked.connect(lambda: (update_provinces(), populate_resources_tree(), append_log_msg("已加载配置")))
     btn_save.clicked.connect(save_config_ui)
     btn_save_global.clicked.connect(save_config_ui)
     btn_save_advanced.clicked.connect(save_config_ui)
@@ -993,11 +1682,7 @@ def create_gui_pyqt(config_path: str) -> None:
     # initialize UI values
     # set provider display text from stored internal key
     provider_combo.setCurrentText(provider_value_to_display.get(current_cfg.get("provider", ""), provider_combo.currentText()))
-    # show resources as JSON for clarity and easy copy/paste
-    try:
-        resources_edit.setText(json.dumps(current_cfg.get("resources", []), ensure_ascii=False))
-    except Exception:
-        resources_edit.setText(','.join(current_cfg.get("resources", [])))
+    # resources tree will be populated and checked by populate_resources_tree()
     export_combo.setCurrentText(str(current_cfg.get("export_format", export_combo.currentText())))
     page_spin.setValue(int(current_cfg.get("default_page_limit", page_spin.value())))
     province_expand_concurrency_spin.setValue(int(current_cfg.get("province_expand_concurrency", province_expand_concurrency_spin.value())))
@@ -1012,6 +1697,15 @@ def create_gui_pyqt(config_path: str) -> None:
     except Exception:
         pass
     update_provinces(); update_cities(); update_counties(); refresh_task_list()
+    # populate trees so user can select regions and resources
+    try:
+        populate_region_tree()
+    except Exception:
+        pass
+    try:
+        populate_resources_tree()
+    except Exception:
+        pass
     # populate log task filter and add Log Query tab to tabs
     populate_log_task_filter()
     # build log query tab layout and add
