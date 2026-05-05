@@ -25,7 +25,6 @@ from poi_utils import (
     dedupe_records,
     bd09_to_gcj02,
     normalize_record,
-    merge_keywords,
     get_city_center,
     append_new_records,
     make_log_entry,
@@ -69,12 +68,6 @@ except Exception:
 # --- 常量 ---
 SUPPORTED_PROVIDERS = ["baidu", "gaode", "tianditu"]
 RESOURCE_TYPES = ["gas_station", "service_area", "hospital", "repair_factory"]
-DEFAULT_KEYWORDS = {
-    "gas_station": ["加油站"],
-    "service_area": ["服务区"],
-    "hospital": ["医院"],
-    "repair_factory": ["维修工厂", "汽车修理厂"],
-}
 AMAP_TYPE_MAP = {
     "hospital": "120000",
     "gas_station": "050700",
@@ -94,16 +87,6 @@ DEFAULT_FIELDS = [
     "task",
     "run_time",
 ]
-
-REGION_DATA = {
-    "北京": ["北京市"],
-    "天津": ["天津市"],
-    "河北": ["石家庄", "唐山", "秦皇岛", "邯郸", "邢台", "保定", "张家口", "承德", "沧州", "廊坊", "衡水"],
-    "山西": ["太原", "大同", "阳泉", "长治", "晋城", "朔州", "晋中", "运城", "忻州", "临汾", "吕梁"],
-    "陕西": ["西安", "铜川", "宝鸡", "咸阳", "渭南", "延安", "汉中", "榆林", "安康", "商洛"],
-    "河南": ["郑州", "开封", "洛阳", "平顶山", "安阳", "鹤壁", "新乡", "焦作", "濮阳", "许昌", "漯河", "三门峡", "南阳", "商丘", "信阳", "周口", "驻马店", "济源"],
-    "湖北": ["武汉", "黄石", "十堰", "宜昌", "襄阳", "鄂州", "荆门", "孝感", "荆州", "黄冈", "咸宁", "随州", "恩施", "仙桃", "潜江", "天门", "神农架"],
-}
 
 CITY_COORDINATES = {
     "石家庄": (38.0428, 114.5149),
@@ -125,24 +108,16 @@ CITY_COORDINATES = {
 
 DEFAULT_CONFIG = {
     "api_keys": {"baidu": "", "gaode": "", "tianditu": ""},
-    "keywords": DEFAULT_KEYWORDS,
     "tasks": [],
     "auto_start": False,
     "scheduler": {"enabled": True, "check_interval_minutes": 15},
     "results_dir": "POI_Data",
     "logs_path": "logs/poi_fetcher_logs.jsonl",
-    # 全局默认（单一提供商、单一导出格式、资源列表、分页、增量、调度间隔）
-    "provider": SUPPORTED_PROVIDERS[0],
-    "resources": ["gas_station"],
     "export_format": "csv",
-    "export_formats": ["csv", "json", "excel"],
     "default_page_limit": 3,
     "incremental": True,
     "schedule_interval_days": 1,
-    "max_concurrency": 3,
-    # 在将省展开为逐城请求时（UI 中城市选择为“全部”），
-    # 控制并发的城市请求数量与每次请求之间的最小延迟
-    "province_expand_concurrency": 1,
+    "max_concurrency": 1,
     "province_expand_delay_seconds": 1,
 }
 
@@ -280,73 +255,121 @@ def fetch_amap_region_hierarchy(api_key: str) -> Dict[str, Any]:
         return {}
 
 
+def _normalize_region_cache_data(raw: Dict[str, Any]) -> Dict[str, Dict[str, List[str]]]:
+    """将行政区缓存规范化为高德命名优先的 {province: {city: [counties...]}} 结构。"""
+    if not isinstance(raw, dict):
+        return {}
+
+    def _expand_country_level(data: Dict[str, Any]) -> Dict[str, Any]:
+        if len(data) == 1:
+            first = next(iter(data))
+            if first in ("中国", "中华人民共和国"):
+                val = data[first]
+                if isinstance(val, dict):
+                    return val
+                if isinstance(val, list):
+                    return {str(prov): {} for prov in val}
+        return data
+
+    def _norm(name: Any) -> str:
+        try:
+            text = str(name or "").strip()
+            for suffix in ["省", "市", "自治区", "特别行政区", "自治州", "地区", "区", "县", "市辖区", "盟", "林区"]:
+                if text.endswith(suffix):
+                    text = text[: -len(suffix)]
+            return text.strip().lower()
+        except Exception:
+            return str(name or "").strip().lower()
+
+    def _prefer_standard_name(candidates: List[str], level: str) -> str:
+        names = [str(name).strip() for name in candidates if str(name).strip()]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+
+        if level == "province":
+            suffixes = ("省", "市", "自治区", "特别行政区")
+        else:
+            suffixes = ("市", "城区", "自治州", "地区", "盟", "林区")
+
+        def score(name: str) -> tuple:
+            suffix_score = 1 if any(name.endswith(suffix) for suffix in suffixes) else 0
+            special_score = 1 if any(token in name for token in ("城区", "自治州", "特别行政区", "林区")) else 0
+            return (suffix_score, special_score, len(name), name)
+
+        return max(names, key=score)
+
+    def _merge_city_values(dest_list: List[Any], src_list: List[Any]) -> List[Any]:
+        seen = set()
+        out = []
+        for item in list(dest_list) + list(src_list):
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                name = str(item).strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(item if isinstance(item, dict) else name)
+        return out
+
+    expanded = _expand_country_level(raw)
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for prov_key, prov_val in expanded.items():
+        prov_name = str(prov_key).strip()
+        prov_norm = _norm(prov_name)
+        prov_bucket = grouped.setdefault(prov_norm, {"names": [], "cities": {}})
+        prov_bucket["names"].append(prov_name)
+
+        if isinstance(prov_val, list):
+            city_items = {str(city): [] for city in prov_val}
+        elif isinstance(prov_val, dict):
+            city_items = prov_val
+        else:
+            city_items = {}
+
+        for city_key, subs in city_items.items():
+            city_name = str(city_key).strip()
+            city_norm = _norm(city_name)
+            city_bucket = prov_bucket["cities"].setdefault(city_norm, {"names": [], "subs": []})
+            city_bucket["names"].append(city_name)
+            if isinstance(subs, list):
+                city_bucket["subs"] = _merge_city_values(city_bucket["subs"], subs)
+
+    normalized: Dict[str, Dict[str, List[str]]] = {}
+    for prov_bucket in grouped.values():
+        province_name = _prefer_standard_name(prov_bucket.get("names", []), "province")
+        normalized[province_name] = {}
+        for city_bucket in prov_bucket.get("cities", {}).values():
+            city_name = _prefer_standard_name(city_bucket.get("names", []), "city")
+            city_subs = []
+            for item in city_bucket.get("subs", []):
+                if isinstance(item, dict):
+                    value = str(item.get("name") or "").strip()
+                else:
+                    value = str(item).strip()
+                if value:
+                    city_subs.append(value)
+            normalized[province_name][city_name] = city_subs
+
+    return normalized
+
+
 def ensure_region_data(config_path: str, api_key: str) -> Dict[str, Dict[str, List[str]]]:
     """确保并返回用于 GUI 的区域数据，结构为 {province: {city: [counties...]}}。
 
     行为：
-      - 优先从 `config/region_cache.json` 加载并规范化为统一结构。
-      - 若缓存不存在或为空，则使用内置常量 `REGION_DATA` 作为回退（不在首次启动时联网）。
-      - 当缓存存在时，保证 `REGION_DATA` 中列出的省/市键至少在返回结构中出现（县可为空）。
+      - 仅从 `config/region_cache.json` 加载并规范化为统一结构。
+      - 若缓存不存在或为空，则返回空字典，不在首次启动时联网，也不注入内置简称。
 
     返回值适用于直接渲染 GUI 树（省->市->区/县）。
     """
     cache_path = get_region_cache_path(config_path)
     cache = load_region_cache(cache_path)
-    # 规范缓存结构，确保返回格式为 {province: {city: [counties...]} }
-    def normalize(raw: Dict[str, Any]) -> Dict[str, Dict[str, List[str]]]:
-        if not isinstance(raw, dict):
-            return {}
-        # 若顶层仅包含一个国家键（例如 '中国' 或 '中华人民共和国'），则展开其值。
-        # 另外处理国家键直接映射到省份列表的格式（某些缓存格式会如此），将其转换为 province->{ } 形式。
-        if len(raw) == 1:
-            first = next(iter(raw))
-            if first in ("中国", "中华人民共和国"):
-                val = raw[first]
-                if isinstance(val, dict):
-                    raw = val
-                elif isinstance(val, list):
-                    raw = {str(prov): {} for prov in val}
-        out: Dict[str, Dict[str, List[str]]] = {}
-        for prov, val in raw.items():
-            # 如果值为城市名称列表，则将其转换为 {city: []}
-            if isinstance(val, list):
-                out[prov] = {str(city): [] for city in val}
-            elif isinstance(val, dict):
-                # 若内部为 city -> 区/县 列表则保留，否则将该城市对应的县列表置为空
-                inner: Dict[str, List[str]] = {}
-                for city, sub in val.items():
-                    if isinstance(sub, list):
-                        inner[str(city)] = [str(x) for x in sub]
-                    else:
-                        inner[str(city)] = []
-                out[prov] = inner
-            else:
-                out[prov] = {}
-        return out
-
     if cache:
-        normalized_cache = normalize(cache)
-        # 确保内置 REGION_DATA 中列出的省/市至少出现在返回结构中
-        try:
-            for prov, cities in REGION_DATA.items():
-                if prov not in normalized_cache:
-                    # 将省添加为键，城市作为键名并初始化空的县列表
-                    normalized_cache[prov] = {city: [] for city in cities}
-                else:
-                    # 确保内置列表中的市在缓存中存在
-                    for c in cities:
-                        if c not in normalized_cache[prov]:
-                            normalized_cache[prov].setdefault(c, [])
-        except Exception:
-            pass
-        return normalized_cache
-
-    # 按用户要求首次运行时不要发起网络请求。
-    # 当缓存缺失时，返回基于内置 REGION_DATA 的回退结构。
-    fallback: Dict[str, Dict[str, List[str]]] = {}
-    for province, cities in REGION_DATA.items():
-        fallback[province] = {city: [] for city in cities}
-    return fallback
+        return _normalize_region_cache_data(cache)
+    return {}
 
 
 def fetch_and_save_region_hierarchy(config_path: str, api_key: str, target_provinces: Optional[List[str]] = None) -> Dict[str, Dict[str, List[str]]]:
@@ -415,104 +438,12 @@ def fetch_and_save_region_hierarchy(config_path: str, api_key: str, target_provi
 def unify_region_cache(config_path: str) -> Dict[str, Any]:
     """规范并合并 `config/region_cache.json` 中的顶层省级键。
 
-    目的：消除不同命名（如 "河南" / "河南省"）导致的重复条目，统一使用 `REGION_DATA` 中的规范省名。
-
-    行为要点：
-      - 比较时去除常见行政区后缀（省、市、自治区等），进行归一化匹配。
-      - 合并同名省份下的城市与区县列表，去重县/区名称。
-      - 确保 `REGION_DATA` 中列出的省份至少存在于缓存中（若不存在则创建空城市列表）。
-      - 将合并后的结果写回缓存文件并返回该字典。
+    目的：消除不同命名（如 "河北" / "河北省"、"石家庄" / "石家庄市"）导致的重复条目，
+    并优先保留高德标准命名。
     """
     cache_path = get_region_cache_path(config_path)
     raw = load_region_cache(cache_path) or {}
-
-    def _norm(s: Any) -> str:
-        try:
-            if s is None:
-                return ""
-            x = str(s).strip()
-            for suf in ["省", "市", "自治区", "特别行政区", "自治州", "地区", "区", "县", "市辖区"]:
-                if x.endswith(suf):
-                    x = x[: -len(suf)]
-            return x.strip().lower()
-        except Exception:
-            return str(s or "").strip().lower()
-
-    # 根据 REGION_DATA 构建规范化映射（归一化名称 -> 规范省名）
-    canonical_map: Dict[str, str] = {}
-    for prov in REGION_DATA.keys():
-        canonical_map[_norm(prov)] = prov
-
-    merged: Dict[str, Any] = {}
-
-    def _merge_city_values(dest_list: List[Any], src_list: List[Any]) -> List[Any]:
-        # dest_list 可能包含 dict 或字符串；按提取出的名称进行去重
-        seen = set()
-        out = []
-        for item in dest_list:
-            name = item.get('name') if isinstance(item, dict) else str(item)
-            name = (name or "").strip()
-            if name and name not in seen:
-                seen.add(name)
-                out.append(item)
-        for item in src_list:
-            name = item.get('name') if isinstance(item, dict) else str(item)
-            name = (name or "").strip()
-            if name and name not in seen:
-                seen.add(name)
-                out.append(item)
-        return out
-
-    try:
-        for prov_key, prov_val in raw.items():
-            target = None
-            nk = _norm(prov_key)
-            if nk in canonical_map:
-                target = canonical_map[nk]
-            else:
-                # 在已合并结果中查找规范化形式相同的键
-                for existing in list(merged.keys()):
-                    if _norm(existing) == nk:
-                        target = existing
-                        break
-                # 回退：使用原始 prov_key
-                if target is None:
-                    target = prov_key
-
-            if target not in merged:
-                merged[target] = {}
-
-            # 将 prov_val 强制归一为 city -> list 的字典结构
-            if isinstance(prov_val, list):
-                for city in prov_val:
-                    merged[target].setdefault(str(city), [])
-            elif isinstance(prov_val, dict):
-                for city, subs in prov_val.items():
-                    try:
-                        if isinstance(subs, list):
-                            merged[target].setdefault(str(city), [])
-                            merged[target][str(city)] = _merge_city_values(merged[target].get(str(city), []), subs)
-                        else:
-                            merged[target].setdefault(str(city), [])
-                    except Exception:
-                        merged[target].setdefault(str(city), [])
-            else:
-                merged[target].setdefault(str(prov_val), {})
-    except Exception:
-        # 出现任何异常时，回退到原始 raw 数据
-        merged = dict(raw)
-
-    # 确保规范省份存在，且至少包含 REGION_DATA 中列出的城市键
-    try:
-        for prov, cities in REGION_DATA.items():
-            if prov not in merged:
-                merged[prov] = {c: [] for c in cities}
-            else:
-                for c in cities:
-                    if c not in merged[prov]:
-                        merged[prov].setdefault(c, [])
-    except Exception:
-        pass
+    merged = _normalize_region_cache_data(raw)
 
     try:
         save_region_cache(cache_path, merged)
@@ -604,6 +535,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
         logger.setLevel(logging.INFO)
     area = get_task_area_summary(task)
     page_limit = int(config.get("default_page_limit", 3))
+    cache_path = get_region_cache_path(str(config.get("_config_path", "config/poi_config.json")))
 
     # 准备增量输出路径并加载用于增量写入的已存在键集合
     base_dir = Path(config.get("results_dir", "POI_Data"))
@@ -656,20 +588,12 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     if task.get("area_type") == "bbox" and not task.get("bbox"):
         raise ValueError("BBox 任务必须包含 bbox 配置。")
 
-    # 资源：优先使用任务级别的 `resources`（GUI 中保存为 code 或名称），
-    # 若任务未指定则回退到全局配置 `config['resources']`。
-    resources = task.get("resources") if task.get("resources") else config.get("resources", [])
+    # 资源仅来自任务本身；高德/天地图使用 data_type_tree 解析编码。
+    resources = task.get("resources", [])
     if not isinstance(resources, list):
         resources = [resources]
-
-    def build_keywords_for_resource(resource_item):
-        try:
-            if isinstance(resource_item, str) and (resource_item in config.get("keywords", {}) or resource_item in RESOURCE_TYPES):
-                return merge_keywords(config, resource_item)
-            else:
-                return [p.strip() for p in re.split(r"[,，]", str(resource_item)) if p.strip()]
-        except Exception:
-            return [p.strip() for p in re.split(r"[,，]", str(resource_item)) if p.strip()]
+    if not resources:
+        raise ValueError("任务必须包含 resources 配置。")
 
     records: List[Dict[str, Any]] = []
 
@@ -756,26 +680,6 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
             progress_callback=use_callback,
             stop_event=stop_event,
         )
-        # 如果提供商专用配置不存在：在首次成功响应后生成最小 provider 配置并保存以便后续使用
-        try:
-            if res:
-                prov_path = config_loader.provider_config_path(provider_arg, "config/poi_config.json")
-                from pathlib import Path as _P
-                if provider_arg not in created_provider_configs and not _P(prov_path).exists():
-                    minimal = {
-                        "api_keys": {provider_arg: api_keys.get(provider_arg, "")},
-                        "resources": config.get("resources", []),
-                        "keywords": config.get("keywords", {}),
-                        "provider": provider_arg,
-                    }
-                    try:
-                        config_loader.save_provider_config(provider_arg, minimal, "config/poi_config.json")
-                        created_provider_configs.add(provider_arg)
-                        append_log(config.get("logs_path"), make_log_entry(task_name, run_time, normalize_area(str(admin_region_arg)), "info", records=0, provider=PROVIDER_DISPLAY.get(provider_arg, provider_arg), message=f"已生成 provider 配置: {prov_path}"))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         return res
 
     def bbox_from_polyline(polyline: str) -> Optional[Dict[str, float]]:
@@ -906,22 +810,40 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
             except Exception:
                 pass
 
-        try:
-            provider_records = fetch_with_delay(
-                provider,
-                api_keys,
-                call_kw,
-                call_place,
-                latitude_arg,
-                longitude_arg,
-                bbox_arg,
-                admin_region_arg,
-                page_limit,
-                stop_event=stop_event,
-                pcallback=_wrapped_progress,
-            )
-        except Exception as exc:
-            append_log(config["logs_path"], {
+        provider_records = []
+        last_exc = None
+        for attempt in range(3):
+            try:
+                provider_records = fetch_with_delay(
+                    provider,
+                    api_keys,
+                    call_kw,
+                    call_place,
+                    latitude_arg,
+                    longitude_arg,
+                    bbox_arg,
+                    admin_region_arg,
+                    page_limit,
+                    stop_event=stop_event,
+                    pcallback=_wrapped_progress,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    try:
+                        emit_progress_lines(
+                            title=f"{task_name} - {area_label} - {resource} - {provider}",
+                            line1=f"{area_label} - {resource}",
+                            line2=f"请求失败，重试 {attempt + 1}/2: {exc}",
+                        )
+                    except Exception:
+                        pass
+                    continue
+        if last_exc is not None:
+            exc = last_exc
+            append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), {
                 "task_name": task_name,
                 "run_time": run_time,
                 "area": normalize_area(str(area_label)),
@@ -972,7 +894,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                 with write_lock:
                     appended = append_new_records(new_norm, str(incremental_path), existing_keys)
                     appended_count = appended
-                    append_log(config["logs_path"], make_log_entry(task_name, run_time, str(area_label), "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                    append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), make_log_entry(task_name, run_time, str(area_label), "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
         except Exception:
             pass
 
@@ -989,7 +911,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     # 收集子任务队列，后续顺序消费以便统一限速/重试策略
     subtasks: List[Dict[str, Any]] = []
     for resource in resources:
-        keywords = list(dict.fromkeys(build_keywords_for_resource(resource)))
+        keywords = [resource]
         try:
             logger.debug("processing resource=%r keywords=%s", resource, keywords)
         except Exception:
@@ -1025,7 +947,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                         # 省级展开（city == "" 表示 UI 中选择了全部市）
                         if cit == "":
                             try:
-                                cache = load_region_cache(get_region_cache_path("config/poi_config.json"))
+                                cache = load_region_cache(cache_path)
                             except Exception:
                                 cache = {}
                             cities_list: List[str] = []
@@ -1035,8 +957,6 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                                     cities_list = [str(x) for x in val]
                                 elif isinstance(val, dict):
                                     cities_list = list(val.keys())
-                            if not cities_list and prov_name in REGION_DATA:
-                                cities_list = list(REGION_DATA.get(prov_name, []))
                             if not cities_list:
                                 cities_list = [""]
 
@@ -1065,14 +985,14 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                         # 市级展开（只有 city 指定、county 为空）
                         if cit and (cnty == "" or cnty is None):
                             try:
-                                cache = load_region_cache(get_region_cache_path("config/poi_config.json"))
+                                cache = load_region_cache(cache_path)
                             except Exception:
                                 cache = {}
                             counties_list: List[str] = []
                             if isinstance(cache, dict) and prov_name in cache:
                                 val = cache[prov_name]
                                 if isinstance(val, dict) and cit in val:
-                                    counties_list = [str(x) for x in val.get(cit, [])]
+                                    counties_list = list(val.get(cit, []))
                             if not counties_list:
                                 gaode_key = api_keys.get("gaode", "")
                                 counties_list = fetch_amap_subdistrict(gaode_key, prov_name, cit)
@@ -1129,14 +1049,14 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                 # 市级展开：遍历区/县
                 if cit and cnty == "":
                     try:
-                        cache = load_region_cache(get_region_cache_path("config/poi_config.json"))
+                        cache = load_region_cache(cache_path)
                     except Exception:
                         cache = {}
                     counties_list: List[str] = []
                     if isinstance(cache, dict) and prov_name in cache:
                         val = cache[prov_name]
                         if isinstance(val, dict) and cit in val:
-                            counties_list = [str(x) for x in val.get(cit, [])]
+                            counties_list = list(val.get(cit, []))
                     if not counties_list:
                         gaode_key = api_keys.get("gaode", "")
                         counties_list = fetch_amap_subdistrict(gaode_key, prov_name, cit)
@@ -1269,13 +1189,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     # 开始顺序消费子任务队列
     # Debug: 输出子任务列表以便定位多区域展开问题
     try:
-        logger.debug("DEBUG: subtasks_count=%d", len(subtasks))
-        print("DEBUG: subtasks_count=", len(subtasks))
-        for _s in subtasks:
-            try:
-                print("DEBUG_SUBTASK:", _s.get('area_label'), _s.get('admin_region'))
-            except Exception:
-                pass
+        logger.debug("subtasks_count=%d", len(subtasks))
     except Exception:
         pass
     total_subtasks = len(subtasks)
@@ -1290,10 +1204,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     except Exception:
         pass
     try:
-        try:
-            max_workers = int(config.get("max_concurrency", 3))
-        except Exception:
-            max_workers = 1
+        max_workers = 1
 
         subtask_attempts = total_subtasks
         subtask_success = 0
@@ -1316,7 +1227,6 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                             "level": level_label,
                             "provider": provider,
                         })
-                        print(f"1245");
                     except Exception:
                         pass
                 emit_progress_lines(
@@ -1344,7 +1254,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                         subtask_success += 1
                 except Exception:
                     try:
-                        append_log(config["logs_path"], make_log_entry(task_name, run_time, "", "error", records=0, provider=PROVIDER_DISPLAY.get(provider, provider), message=f"子任务异常"))
+                        append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), make_log_entry(task_name, run_time, "", "error", records=0, provider=PROVIDER_DISPLAY.get(provider, provider), message=f"子任务异常"))
                     except Exception:
                         pass
         else:
@@ -1400,7 +1310,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                         subtask_success += 1
                     except Exception as exc:
                         try:
-                            append_log(config["logs_path"], make_log_entry(task_name, run_time, "", "error", records=0, provider=PROVIDER_DISPLAY.get(provider, provider), message=f"子任务异常: {exc}"))
+                            append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), make_log_entry(task_name, run_time, "", "error", records=0, provider=PROVIDER_DISPLAY.get(provider, provider), message=f"子任务异常: {exc}"))
                         except Exception:
                             pass
                         # 将错误通过 progress_callback 也发送到日志窗口/UI
@@ -1437,7 +1347,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
             "total_fetched": int(total_fetched) if 'total_fetched' in locals() else 0,
         }
         entry["area"] = normalize_area(entry.get("area", ""))
-        append_log(config["logs_path"], entry)
+        append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), entry)
         if progress_callback:
             try:
                 progress_callback({"type": "task_done", "task_name": task_name, "records": 0})
@@ -1459,11 +1369,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     base_dir = Path(config.get("results_dir", "POI_Data"))
     output_base = base_dir / date_folder / f"{task_name}_{timestamp}"
     saved_paths: List[str] = []
-    formats: List[str] = []
-    if config.get("export_format"):
-        formats = [config.get("export_format")]
-    else:
-        formats = config.get("export_formats", [])
+    formats: List[str] = [config.get("export_format", "csv")]
     if "csv" in formats:
         saved_paths.append(save_to_csv(records, f"{output_base}.csv"))
     if "json" in formats:
@@ -1488,7 +1394,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
         "total_fetched": int(total_fetched) if 'total_fetched' in locals() else None,
     }
     entry["area"] = normalize_area(entry.get("area", ""))
-    append_log(config["logs_path"], entry)
+    append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), entry)
     if progress_callback:
         try:
             progress_callback({"type": "task_done", "task_name": task_name, "records": len(records)})
@@ -1565,9 +1471,8 @@ def start_scheduler(config: Dict[str, Any]) -> threading.Thread:
 # --- CLI / GUI ---
 
 def list_tasks(config: Dict[str, Any]) -> None:
-    global_resources = config.get("resources", [])
     for task in config.get("tasks", []):
-        print(f"- {task.get('name')} (enabled={task.get('enabled', True)}, area={get_task_area_summary(task)}, resources={global_resources})")
+        print(f"- {task.get('name')} (enabled={task.get('enabled', True)}, area={get_task_area_summary(task)}, resources={task.get('resources', [])})")
 
 
 def show_logs(config: Dict[str, Any], status: Optional[str] = None) -> None:
@@ -1604,7 +1509,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-scheduled", action="store_true", help="执行到期的调度任务")
     parser.add_argument("--show-logs", action="store_true", help="显示日志")
     parser.add_argument("--export-logs", help="导出日志到 CSV/JSON 文件")
-    parser.add_argument("--add-keyword", nargs=2, metavar=("RESOURCE", "KEYWORD"), help="向资源类型添加关键字")
     parser.add_argument("--gui", action="store_true", help="启动图形界面")
     parser.add_argument("--retry-failed", action="store_true", help="重试失败任务")
     parser.add_argument("--allow-auto-start", action="store_true", help="程序启动时执行调度任务")
@@ -1620,6 +1524,7 @@ def load_config(path: str) -> Dict[str, Any]:
     merged = DEFAULT_CONFIG.copy()
     if isinstance(cfg, dict):
         merged.update(cfg)
+    merged["_config_path"] = path
     return merged
 
 
@@ -1634,7 +1539,6 @@ def main() -> None:
     args = parse_args()
     no_cli_flags = not any([
         args.init_config,
-        args.add_keyword,
         args.list_tasks,
         args.run_all,
         args.run_task,
@@ -1653,19 +1557,6 @@ def main() -> None:
     if args.init_config:
         create_default_config(args.config)
         print(f"已生成默认配置：{args.config}")
-        return
-    if args.add_keyword:
-        resource, keyword = args.add_keyword
-        if resource not in RESOURCE_TYPES:
-            print(f"未知资源类型: {resource}")
-            return
-        keywords = config.setdefault("keywords", {}).setdefault(resource, [])
-        if keyword not in keywords:
-            keywords.append(keyword)
-            save_json(args.config, config)
-            print(f"已添加关键字 '{keyword}' 到资源 {resource}")
-        else:
-            print(f"关键字已存在: {keyword}")
         return
     if args.list_tasks:
         list_tasks(config)
