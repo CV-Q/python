@@ -51,6 +51,23 @@ def _find_leaf_by_text(tree, text):
     return None
 
 
+def _find_first_leaf(tree):
+    def walk(node):
+        if node.childCount() == 0:
+            return node
+        for index in range(node.childCount()):
+            found = walk(node.child(index))
+            if found is not None:
+                return found
+        return None
+
+    for index in range(tree.topLevelItemCount()):
+        found = walk(tree.topLevelItem(index))
+        if found is not None:
+            return found
+    return None
+
+
 def main() -> None:
     temp_dir = Path("config/test_gui_save_task_regions")
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -130,5 +147,84 @@ def main() -> None:
     print("gui save task regions regression passed")
 
 
+def test_direct_admin_province_save_as_city_all() -> None:
+    temp_dir = Path("config/test_gui_save_task_regions_direct_admin")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    config_path = temp_dir / "poi_config.json"
+    cache_path = temp_dir / "region_cache.json"
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "api_keys": {"baidu": "", "gaode": "", "tianditu": ""},
+                "tasks": [],
+                "auto_start": False,
+                "scheduler": {"enabled": True, "check_interval_minutes": 15},
+                "results_dir": "POI_Data",
+                "logs_path": "logs/poi_fetcher_logs.jsonl",
+                "export_format": "csv",
+                "default_page_limit": 1,
+                "incremental": False,
+                "schedule_interval_days": 1,
+                "max_concurrency": 1,
+                "province_expand_delay_seconds": 0,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    cache_path.write_text(
+        json.dumps(
+            {
+                "北京市": {
+                    "北京城区": ["东城区", "西城区"]
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    hooks = {"skip_event_loop": True}
+    gui_pyqt.create_gui_pyqt(str(config_path), hooks)
+    widgets = hooks["widgets"]
+    actions = hooks["actions"]
+
+    widgets["task_name_edit"].setText("gui_region_save_direct_admin")
+    widgets["area_type_combo"].setCurrentText("行政区")
+    widgets["provider_combo"].setCurrentText("天地图")
+    actions["populate_resources_tree"]()
+
+    resource_leaf = _find_first_leaf(widgets["resources_tree"])
+    assert resource_leaf is not None, "资源树中应存在可选资源"
+    resource_leaf.setCheckState(0, gui_pyqt.QtCore.Qt.Checked)
+
+    province_item = _find_tree_item(widgets["region_tree"], ["北京市"])
+    assert province_item is not None, "地区树中应存在 北京市"
+    province_item.setCheckState(0, gui_pyqt.QtCore.Qt.Checked)
+
+    actions["save_task"]()
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    task = saved["tasks"][0]
+    assert task["admin_regions"] == [
+        {
+            "country": "中华人民共和国",
+            "province": "北京市",
+            "city": "北京城区",
+            "county": "全部",
+        }
+    ], task
+
+    hooks["win"].close()
+    hooks["app"].quit()
+    config_path.unlink(missing_ok=True)
+    cache_path.unlink(missing_ok=True)
+    temp_dir.rmdir()
+
+
 if __name__ == "__main__":
     main()
+    test_direct_admin_province_save_as_city_all()

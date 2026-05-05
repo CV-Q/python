@@ -1293,6 +1293,8 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
             # collect selected regions from region_tree using the original UI selection semantics
             selected_regions = []
             try:
+                direct_admin_provinces = {"北京市", "天津市", "上海市", "重庆市"}
+
                 def append_region(province_name, city_name, county_name):
                     selected_regions.append({
                         "country": country_label.text(),
@@ -1307,6 +1309,11 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
                     text = node.text(0)
                     if explicit:
                         if parent is None:
+                            if text in direct_admin_provinces and node.childCount() == 1:
+                                city_item = node.child(0)
+                                if city_item is not None and city_item.text(0):
+                                    append_region(text, city_item.text(0), "全部")
+                                    return
                             append_region(text, "", "")
                             return
                         if parent.parent() is None:

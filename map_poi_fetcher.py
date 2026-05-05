@@ -951,14 +951,47 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                             except Exception:
                                 cache = {}
                             cities_list: List[str] = []
+                            province_cache = {}
                             if isinstance(cache, dict) and prov_name in cache:
                                 val = cache[prov_name]
+                                province_cache = val if isinstance(val, dict) else {}
                                 if isinstance(val, list):
                                     cities_list = [str(x) for x in val]
                                 elif isinstance(val, dict):
                                     cities_list = list(val.keys())
                             if not cities_list:
                                 cities_list = [""]
+
+                            # 直辖市在缓存中通常只有一个“城区”节点；省级空 city 配置应直接下钻到区县。
+                            if isinstance(province_cache, dict) and len(cities_list) == 1:
+                                municipality_city = cities_list[0]
+                                municipality_counties = list(province_cache.get(municipality_city, []))
+                                if municipality_city and municipality_counties:
+                                    for county_name in municipality_counties:
+                                        county_display = county_name.get("name") if isinstance(county_name, dict) else county_name
+                                        county_adcode = county_name.get("adcode") if isinstance(county_name, dict) else ""
+                                        if progress_callback:
+                                            try:
+                                                progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": municipality_city, "county": county_display, "level": "county", "provider": provider})
+                                            except Exception:
+                                                pass
+                                        admin_region_param = {"province": prov_name, "city": municipality_city, "county": county_display}
+                                        if county_adcode:
+                                            admin_region_param["adcode"] = county_adcode
+                                        call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
+                                        logger.debug("append direct-admin county subtask prov=%r city=%r county=%r resource=%r", prov_name, municipality_city, county_display, resource)
+                                        subtasks.append({
+                                            "call_kw": call_kw,
+                                            "call_place": call_place,
+                                            "latitude": None,
+                                            "longitude": None,
+                                            "bbox": None,
+                                            "admin_region": admin_region_param,
+                                            "resource": resource,
+                                            "area_label": f"{prov_name} / {municipality_city} / {county_display}",
+                                            "level_label": "county",
+                                        })
+                                    continue
 
                             for city_name in cities_list:
                                 if progress_callback:
