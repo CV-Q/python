@@ -1,11 +1,33 @@
-# Ignore sensitive config and runtime/build artifacts
+# Local runtime config and caches
 config/poi_config.json
+config/region_cache.json
+config/*.bak
+config/test_*/
+config/test_*.json
+config/__first_start_test.json
+config/poi_config---.json
+config/region_cache*.json
+
+# Runtime outputs
 POI_Data/
+POI_Data_test/
 logs/
+
+# Build and packaging artifacts
 build/
+dist/
 bin/
+*.exe
+*.zip
+
+# Python cache and virtual environments
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
 .venv/
 venv/
+
+# Local environment files
 .env
