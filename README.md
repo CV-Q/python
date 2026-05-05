@@ -83,7 +83,6 @@
 - 使用 provider API 需要在配置文件中设置相应的 API key（`config/poi_config.json`）。
 - Excel 导出需要 `openpyxl`。
 
-
 ## 2026-05-05 变更记录
 
 - 配置模型收口为单一 `config/poi_config.json`，运行时仅使用 `tasks[*]` 中的 `provider`、`resources` 与 `admin_regions`，移除了旧的顶层兼容字段依赖。
