@@ -1,4 +1,5 @@
 import json
+import csv
 from pathlib import Path
 
 import map_poi_fetcher as mp
@@ -234,10 +235,114 @@ def test_runtime_direct_admin_province_expands_to_counties() -> None:
         temp_dir.rmdir()
 
 
+def test_runtime_export_contains_admin_fields() -> None:
+    temp_dir = Path("config/test_runtime_export_admin_fields")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    config_path = temp_dir / "poi_config.json"
+    cache_path = temp_dir / "region_cache.json"
+    results_dir = temp_dir / "results"
+
+    config_path.write_text("{}", encoding="utf-8")
+    cache_path.write_text(
+        json.dumps(
+            {
+                "河北省": {
+                    "石家庄市": ["桥西区"]
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_fetch(provider, api_keys, keyword, place_type, latitude, longitude, bbox, admin_region, page_limit, progress_callback=None, stop_event=None, debug=False):
+        return [
+            {
+                "id": "poi-1",
+                "name": "示例医院",
+                "address": "示例地址",
+                "contact": "",
+                "latitude": 38.0,
+                "longitude": 114.0,
+                "source": provider,
+            }
+        ]
+
+    orig_fetch = mp.fetch_provider_records
+    mp.fetch_provider_records = fake_fetch
+    try:
+        config = {
+            "api_keys": {"tianditu": "dummy"},
+            "tasks": [],
+            "_config_path": str(config_path),
+            "results_dir": str(results_dir),
+            "logs_path": str(temp_dir / "logs.jsonl"),
+            "export_format": "csv",
+            "default_page_limit": 1,
+            "incremental": True,
+            "max_concurrency": 1,
+            "province_expand_delay_seconds": 0,
+            "scheduler": {"enabled": True, "check_interval_minutes": 15},
+            "schedule_interval_days": 1,
+            "auto_start": False,
+        }
+        task = {
+            "name": "runtime_export_admin_fields",
+            "enabled": True,
+            "area_type": "admin",
+            "provider": "tianditu",
+            "resources": ["170101"],
+            "admin_regions": [
+                {
+                    "country": "中华人民共和国",
+                    "province": "河北省",
+                    "city": "石家庄市",
+                    "county": "桥西区",
+                }
+            ],
+        }
+        result = mp.run_task(task, config, mode="manual")
+        assert result["status"] == "success", result
+
+        exported_csv = next(results_dir.rglob("*.csv"))
+        with exported_csv.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert rows, "应导出至少一条记录"
+        assert rows[0]["province"] == "河北省", rows[0]
+        assert rows[0]["city"] == "石家庄市", rows[0]
+        assert rows[0]["county"] == "桥西区", rows[0]
+
+        incremental_csv = next(results_dir.rglob("*_incremental.csv"))
+        with incremental_csv.open("r", encoding="utf-8-sig", newline="") as f:
+            incremental_rows = list(csv.DictReader(f))
+        assert incremental_rows[0]["province"] == "河北省", incremental_rows[0]
+        assert incremental_rows[0]["city"] == "石家庄市", incremental_rows[0]
+        assert incremental_rows[0]["county"] == "桥西区", incremental_rows[0]
+    finally:
+        mp.fetch_provider_records = orig_fetch
+        if cache_path.exists():
+            cache_path.unlink()
+        if config_path.exists():
+            config_path.unlink()
+        if (temp_dir / "logs.jsonl").exists():
+            (temp_dir / "logs.jsonl").unlink()
+        if results_dir.exists():
+            for child in results_dir.rglob("*"):
+                if child.is_file():
+                    child.unlink()
+            for child in sorted(results_dir.rglob("*"), reverse=True):
+                if child.is_dir():
+                    child.rmdir()
+            results_dir.rmdir()
+        temp_dir.rmdir()
+
+
 def main() -> None:
     test_runtime_city_all_expansion()
     test_provider_paging_accumulates_all_results()
     test_runtime_direct_admin_province_expands_to_counties()
+    test_runtime_export_contains_admin_fields()
     print("runtime subtasks and paging regression passed")
 
 

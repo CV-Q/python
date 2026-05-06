@@ -85,6 +85,9 @@ DEFAULT_FIELDS = [
     "type",
     "contact",
     "task",
+    "province",
+    "city",
+    "county",
     "run_time",
 ]
 
@@ -388,6 +391,11 @@ def fetch_and_save_region_hierarchy(config_path: str, api_key: str, target_provi
     except Exception:
         fetched = {}
 
+    def _normalize_county_name(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get("name") or "").strip()
+        return str(item or "").strip()
+
     # 将抓取到的层级规范为仅包含字符串名称的结构
     out_fetched: Dict[str, Dict[str, List[str]]] = {}
     if isinstance(fetched, dict):
@@ -396,12 +404,31 @@ def fetch_and_save_region_hierarchy(config_path: str, api_key: str, target_provi
                 if isinstance(cities, dict):
                     out_fetched[prov] = {}
                     for city, subs in cities.items():
+                        normalized_subs: List[str] = []
                         if isinstance(subs, list):
-                            out_fetched[prov][city] = [str(x.get('name') if isinstance(x, dict) and x.get('name') else x) for x in subs if x]
-                        else:
-                            out_fetched[prov][city] = []
+                            normalized_subs = [_normalize_county_name(x) for x in subs if _normalize_county_name(x)]
+                        if not normalized_subs and city:
+                            try:
+                                normalized_subs = [
+                                    _normalize_county_name(x)
+                                    for x in fetch_amap_subdistrict(api_key, str(prov), str(city))
+                                    if _normalize_county_name(x)
+                                ]
+                            except Exception:
+                                normalized_subs = []
+                        out_fetched[prov][city] = normalized_subs
                 elif isinstance(cities, list):
-                    out_fetched[prov] = {str(c): [] for c in cities}
+                    out_fetched[prov] = {}
+                    for city in cities:
+                        city_name = str(city)
+                        try:
+                            out_fetched[prov][city_name] = [
+                                _normalize_county_name(x)
+                                for x in fetch_amap_subdistrict(api_key, str(prov), city_name)
+                                if _normalize_county_name(x)
+                            ]
+                        except Exception:
+                            out_fetched[prov][city_name] = []
                 else:
                     out_fetched[prov] = {}
             except Exception:
@@ -867,7 +894,7 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
 
         # 归一化并追加到共享 records（并发写保护）
         try:
-            new_norm = [normalize_record(provider, item, resource, task_name, run_time) for item in provider_records]
+            new_norm = [normalize_record(provider, item, resource, task_name, run_time, admin_region=admin_region_arg) for item in provider_records]
             with write_lock:
                 records.extend(new_norm)
         except Exception:

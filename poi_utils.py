@@ -19,6 +19,9 @@ DEFAULT_FIELDS = [
     "type",
     "contact",
     "task",
+    "province",
+    "city",
+    "county",
     "run_time",
 ]
 
@@ -323,11 +326,19 @@ def bd09_to_gcj02(lng: float, lat: float) -> (float, float):
     return z * math.cos(theta), z * math.sin(theta)
 
 
-def normalize_record(source: str, element: Dict[str, Any], place_type: str, task_name: str, run_time: str) -> Dict[str, Any]:
+def normalize_record(
+    source: str,
+    element: Dict[str, Any],
+    place_type: str,
+    task_name: str,
+    run_time: str,
+    admin_region: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     latitude = element.get("latitude") or element.get("lat") or element.get("location_lat")
     longitude = element.get("longitude") or element.get("lng") or element.get("location_lng")
     if source == "baidu" and latitude is not None and longitude is not None:
         longitude, latitude = bd09_to_gcj02(float(longitude), float(latitude))
+    admin_region = admin_region or {}
     return {
         "source": source,
         "id": element.get("id") or element.get("uid") or element.get("sid") or "",
@@ -338,6 +349,9 @@ def normalize_record(source: str, element: Dict[str, Any], place_type: str, task
         "type": place_type,
         "contact": element.get("contact", "") or element.get("telephone", "") or element.get("tel", ""),
         "task": task_name,
+        "province": admin_region.get("province", "") or "",
+        "city": admin_region.get("city", "") or "",
+        "county": admin_region.get("county", "") or "",
         "run_time": run_time,
     }
 

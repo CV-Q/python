@@ -638,11 +638,31 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
             tw = item.treeWidget()
             setattr(tw, '_updating', True)
             try:
+                normalized_subs = []
+                for entry in subs:
+                    name = entry.get('name') if isinstance(entry, dict) else str(entry)
+                    if name:
+                        normalized_subs.append(str(name))
+
+                region_data.setdefault(prov, {})
+                region_data[prov][cit] = list(normalized_subs)
+                try:
+                    cache_path = get_region_cache_path(cfg_path)
+                    cache = load_region_cache(cache_path) or {}
+                    if not isinstance(cache, dict):
+                        cache = {}
+                    cache.setdefault(prov, {})
+                    if not isinstance(cache.get(prov), dict):
+                        cache[prov] = {}
+                    cache[prov][cit] = list(normalized_subs)
+                    save_region_cache(cache_path, cache)
+                except Exception:
+                    pass
+
                 # clear existing children (e.g., placeholder "全部")
                 while item.childCount() > 0:
                     item.removeChild(item.child(0))
-                for c in subs:
-                    cname = c.get('name') if isinstance(c, dict) else str(c)
+                for cname in normalized_subs:
                     if not cname:
                         continue
                     county_item = QtWidgets.QTreeWidgetItem([cname])
