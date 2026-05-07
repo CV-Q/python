@@ -82,7 +82,8 @@ def append_new_records(records: List[Dict[str, Any]], path: str, existing_keys: 
 
     Returns number appended and updates existing_keys in-place if provided.
     """
-    existing_keys = existing_keys or set()
+    if existing_keys is None:
+        existing_keys = set()
     to_append: List[Dict[str, Any]] = []
     # helper to check if a name has any coord-key in existing_keys
     def name_has_coord(name: str) -> bool:
@@ -221,7 +222,8 @@ def build_record_key(record: Dict[str, Any]) -> str:
 
 
 def dedupe_records(records: List[Dict[str, Any]], existing_keys: Optional[set] = None) -> List[Dict[str, Any]]:
-    existing_keys = existing_keys or set()
+    if existing_keys is None:
+        existing_keys = set()
     deduped: List[Dict[str, Any]] = []
     seen = set(existing_keys)
 

@@ -35,8 +35,9 @@ POI 抓取工具 — 使用说明（简明）
 - 为避免命名不一致导致的重复/缺失，工具内置了 `unify_region_cache` 来规范化 `region_cache` 的顶层省名（例如："河南" 与 "河南省" 会合并为统一键）。
 
 增量（incremental）策略
-- 增量文件保存在 `POI_Data/YYYY-MM-DD/任务名_incremental.csv`。
-- 去重逻辑：仅与该增量文件中的 key 做比对，不会与历史所有文件合并去重（满足每任务增量的需求）。
+- 增量文件保存在 `POI_Data/incremental/<provider>/<provider>-<province>_incremental.csv`。
+- 去重逻辑：仅与对应 `provider+province` 的固定增量文件中的 key 做比对，可跨天复用历史基线。
+- 全量快照导出保持不变，仍输出到 `POI_Data/YYYY-MM-DD/任务名_YYYYMMDD_HHMMSS.csv`。
 
 常见操作命令
 - 列出任务：`python map_poi_fetcher.py --list-tasks --config config/poi_config.json`

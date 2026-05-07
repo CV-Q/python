@@ -44,8 +44,9 @@
 
 增量（incremental）策略
 
-- 增量文件保存在 `POI_Data/YYYY-MM-DD/任务名_incremental.csv`。
-- 去重逻辑：仅与该增量文件中的 key 做比对，不会与历史所有文件合并去重（满足每任务增量的需求）。
+- 增量文件保存在 `POI_Data/incremental/<provider>/<provider>-<province>_incremental.csv`。
+- 去重逻辑：仅与对应 `provider+province` 的固定增量文件中的 key 做比对，可跨天复用历史基线。
+- 全量快照导出保持不变，仍输出到 `POI_Data/YYYY-MM-DD/任务名_YYYYMMDD_HHMMSS.csv`。
 
 常见操作命令
 
@@ -53,6 +54,12 @@
 - 执行单个任务：`python map_poi_fetcher.py --run-task "任务名" --config config/poi_config.json`
 - 执行所有任务：`python map_poi_fetcher.py --run-all --config config/poi_config.json`
 - 导出日志：`python map_poi_fetcher.py --export-logs logs_export.json --config config/poi_config.json`
+
+EXE 打包（Windows）
+
+- 一键脚本：`powershell -ExecutionPolicy Bypass -File tools/build_exe.ps1`
+- 干跑检查（不真正打包）：`powershell -ExecutionPolicy Bypass -File tools/build_exe.ps1 -DryRun`
+- 打包输出：`dist/poi_fetcher_gui/poi_fetcher_gui.exe`
 
 更新记录（简要）
 

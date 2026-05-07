@@ -514,6 +514,20 @@ def get_task_area_summary(task: Dict[str, Any]) -> str:
     return normalize_area(f"{admin.get('province','')} / {admin.get('city','')} / {admin.get('county','')}")
 
 
+def _safe_filename_part(text: str) -> str:
+    """Make a conservative filename part for Windows-compatible paths."""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(text or "").strip())
+    return cleaned or "unknown"
+
+
+def build_incremental_path(config: Dict[str, Any], provider: str, province: str) -> Path:
+    """Build fixed incremental path by provider+province."""
+    base_dir = Path(config.get("results_dir", "POI_Data"))
+    provider_part = _safe_filename_part(provider)
+    province_part = _safe_filename_part(province)
+    return base_dir / "incremental" / provider_part / f"{provider_part}-{province_part}_incremental.csv"
+
+
 def format_time(dt: Optional[datetime]) -> str:
     return dt.isoformat(timespec="seconds") if dt else ""
 
@@ -564,24 +578,10 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     page_limit = int(config.get("default_page_limit", 3))
     cache_path = get_region_cache_path(str(config.get("_config_path", "config/poi_config.json")))
 
-    # 准备增量输出路径并加载用于增量写入的已存在键集合
-    base_dir = Path(config.get("results_dir", "POI_Data"))
-    date_folder = datetime.now().strftime("%Y-%m-%d")
-    result_dir = base_dir / date_folder
-    incremental_path = result_dir / f"{task_name}_incremental.csv"
-    existing_keys = set()
-    if config.get("incremental", True):
-        try:
-            # 按用户要求：最终去重只针对增量文件中的键进行检查
-            if incremental_path.exists():
-                existing_keys = load_keys_from_file(str(incremental_path))
-            else:
-                existing_keys = set()
-        except Exception:
-            existing_keys = set()
-    # 保存运行开始时的增量键快照，用于在运行结束时进行最终去重，
-    # 避免把本次运行过程中 append_new_records 已写入文件的记录当作“已存在”键
-    initial_existing_keys = set(existing_keys)
+    # 增量模式：按 提供商+省 使用固定文件；每个文件维护独立的 existing_keys
+    # 记录首次加载的键并汇总为 initial_existing_keys_union，用于运行结束时的最终去重。
+    incremental_keys_by_path: Dict[str, set] = {}
+    initial_existing_keys_union: set = set()
 
     # 确定提供商：仅使用任务级 `provider` 来指定单一提供商；若任务未指定则使用内置支持列表
     prov = task.get("provider")
@@ -917,11 +917,39 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
 
         try:
             if config.get("incremental", True) and new_norm:
-                # 增量写入与 existing_keys 更新须由写锁保护
+                # 按 province 分组写入固定增量文件，避免任务名变化导致的基线断裂。
+                grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+                fallback_province = str((admin_region_arg or {}).get("province") or "").strip()
+                for rec in new_norm:
+                    province_name = str(rec.get("province") or fallback_province or "unknown").strip() or "unknown"
+                    inc_path = build_incremental_path(config, provider, province_name)
+                    grouped[str(inc_path)].append(rec)
+
                 with write_lock:
-                    appended = append_new_records(new_norm, str(incremental_path), existing_keys)
-                    appended_count = appended
-                    append_log(config.get("logs_path", "logs/poi_fetcher_logs.jsonl"), make_log_entry(task_name, run_time, str(area_label), "partial", records=appended, provider=PROVIDER_DISPLAY.get(provider, provider), message="incremental append"))
+                    for inc_path_str, part_records in grouped.items():
+                        if inc_path_str not in incremental_keys_by_path:
+                            try:
+                                keys = load_keys_from_file(inc_path_str) if Path(inc_path_str).exists() else set()
+                            except Exception:
+                                keys = set()
+                            incremental_keys_by_path[inc_path_str] = keys
+                            initial_existing_keys_union.update(keys)
+
+                        existing_keys_for_path = incremental_keys_by_path[inc_path_str]
+                        appended_count += append_new_records(part_records, inc_path_str, existing_keys_for_path)
+
+                    append_log(
+                        config.get("logs_path", "logs/poi_fetcher_logs.jsonl"),
+                        make_log_entry(
+                            task_name,
+                            run_time,
+                            str(area_label),
+                            "partial",
+                            records=appended_count,
+                            provider=PROVIDER_DISPLAY.get(provider, provider),
+                            message="incremental append",
+                        ),
+                    )
         except Exception:
             pass
 
@@ -1020,7 +1048,41 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                                         })
                                     continue
 
+                            gaode_key = api_keys.get("gaode", "")
                             for city_name in cities_list:
+                                county_items: List[Any] = []
+                                if isinstance(province_cache, dict) and city_name in province_cache:
+                                    county_items = list(province_cache.get(city_name, []))
+                                if city_name and not county_items:
+                                    county_items = fetch_amap_subdistrict(gaode_key, prov_name, city_name)
+
+                                if city_name and county_items:
+                                    for county_name in county_items:
+                                        county_display = county_name.get("name") if isinstance(county_name, dict) else county_name
+                                        county_adcode = county_name.get("adcode") if isinstance(county_name, dict) else ""
+                                        if progress_callback:
+                                            try:
+                                                progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": city_name, "county": county_display, "level": "county", "provider": provider})
+                                            except Exception:
+                                                pass
+                                        admin_region_param = {"province": prov_name, "city": city_name, "county": county_display}
+                                        if county_adcode:
+                                            admin_region_param["adcode"] = county_adcode
+                                        call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
+                                        logger.debug("append province county subtask prov=%r city=%r county=%r resource=%r", prov_name, city_name, county_display, resource)
+                                        subtasks.append({
+                                            "call_kw": call_kw,
+                                            "call_place": call_place,
+                                            "latitude": None,
+                                            "longitude": None,
+                                            "bbox": None,
+                                            "admin_region": admin_region_param,
+                                            "resource": resource,
+                                            "area_label": f"{prov_name} / {city_name} / {county_display}",
+                                            "level_label": "county",
+                                        })
+                                    continue
+
                                 if progress_callback:
                                     try:
                                         progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": city_name, "level": "city", "provider": provider})
@@ -1386,9 +1448,8 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
     records = dedupe_records(records)
     if config.get("incremental", True):
         try:
-            # 使用运行开始时的增量键快照进行最终去重，
-            # 这样本次运行期间已写入增量文件的记录不会把内存中的 records 全部去掉
-            existing_keys_for_final = initial_existing_keys
+            # 仅使用运行开始时的增量键快照做最终去重，避免把本次运行新增全部滤掉。
+            existing_keys_for_final = initial_existing_keys_union
         except Exception:
             existing_keys_for_final = set()
         records = dedupe_records(records, existing_keys=existing_keys_for_final)
