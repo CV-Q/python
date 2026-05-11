@@ -55,14 +55,19 @@ def main() -> None:
     actions = hooks["actions"]
 
     widgets["task_name_edit"].setText("gui_resource_save")
-    widgets["area_type_combo"].setCurrentText("BBox")
+    widgets["area_type_combo"].setCurrentText("多边形")
     widgets["provider_combo"].setCurrentText("天地图")
     actions["populate_resources_tree"]()
 
-    widgets["bbox_left"].setText("116.0")
-    widgets["bbox_bottom"].setText("39.0")
-    widgets["bbox_right"].setText("117.0")
-    widgets["bbox_top"].setText("40.0")
+    polygon_points = [
+        (116.0, 40.0),
+        (117.0, 40.0),
+        (117.0, 39.0),
+        (116.0, 39.0),
+    ]
+    for index, (lng, lat) in enumerate(polygon_points):
+        widgets["polygon_point_spins"][index]["lng"].setValue(lng)
+        widgets["polygon_point_spins"][index]["lat"].setValue(lat)
 
     leaf = _find_leaf_by_text(widgets["resources_tree"], "综合医院")
     assert leaf is not None, "资源树中应存在 综合医院"
@@ -74,7 +79,8 @@ def main() -> None:
     task = saved["tasks"][0]
     assert task["provider"] == "tianditu", task
     assert task["resources"] == ["170101"], task
-    assert task["bbox"] == {"left": 116.0, "bottom": 39.0, "right": 117.0, "top": 40.0}, task
+    assert task["polygon"] == "116,40|117,40|117,39|116,39|116,40", task
+    assert task["bbox"] == {"left": 116.0, "bottom": 39.0, "right": 117.0, "top": 40.0, "polygon": "116,40|117,40|117,39|116,39|116,40"}, task
 
     hooks["win"].close()
     hooks["app"].quit()

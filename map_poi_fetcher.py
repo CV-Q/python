@@ -484,6 +484,9 @@ def unify_region_cache(config_path: str) -> Dict[str, Any]:
 def build_area_description(task: Dict[str, Any]) -> str:
     if task.get("area_type") == "bbox":
         bbox = task.get("bbox", {})
+        poly = task.get("polygon") or (bbox.get("polygon") if isinstance(bbox, dict) else None)
+        if poly:
+            return f"polygon({poly})"
         return f"bbox({bbox.get('left')},{bbox.get('top')},{bbox.get('right')},{bbox.get('bottom')})"
     # 若存在 admin_regions（新格式），则优先使用其中的第一项，否则使用 admin_region
     admin = {}
@@ -504,6 +507,9 @@ def task_target_values(task: Dict[str, Any]) -> Dict[str, Any]:
 def get_task_area_summary(task: Dict[str, Any]) -> str:
     if task.get("area_type") == "bbox":
         bbox = task.get("bbox", {})
+        poly = task.get("polygon") or (bbox.get("polygon") if isinstance(bbox, dict) else None)
+        if poly:
+            return f"Polygon {poly}"
         return f"BBox {bbox.get('left')} , {bbox.get('bottom')} -> {bbox.get('right')} , {bbox.get('top')}"
     # 若存在 admin_regions 列表，摘要优先使用首条
     admin = {}
@@ -1168,139 +1174,27 @@ def run_task(task: Dict[str, Any], config: Dict[str, Any], mode: str = "manual",
                         })
                     # 完成 admin_regions 的展开后，跳到下一个 keyword
                     continue
-                # 市级展开：遍历区/县
-                if cit and cnty == "":
-                    try:
-                        cache = load_region_cache(cache_path)
-                    except Exception:
-                        cache = {}
-                    counties_list: List[str] = []
-                    if isinstance(cache, dict) and prov_name in cache:
-                        val = cache[prov_name]
-                        if isinstance(val, dict) and cit in val:
-                            counties_list = list(val.get(cit, []))
-                    if not counties_list:
-                        gaode_key = api_keys.get("gaode", "")
-                        counties_list = fetch_amap_subdistrict(gaode_key, prov_name, cit)
-                    if not counties_list:
-                        counties_list = [""]
-
-                    for county_name in counties_list:
-                        # 支持 counties_list 条目为包含 adcode 的 dict 格式
-                        county_display = county_name.get("name") if isinstance(county_name, dict) else county_name
-                        county_adcode = county_name.get("adcode") if isinstance(county_name, dict) else ""
-                        if progress_callback:
-                            try:
-                                progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": cit, "county": county_display, "level": "county", "provider": provider})
-                                print(f"1098");
-                            except Exception:
-                                pass
-                            # emit_progress_lines(
-                            #     title=f"{task_name} - {prov_name}/{cit}/{county_display} - {resource} - {provider}",
-                            #     line1=f"{prov_name}/{cit}/{county_display} - {resource}",
-                            #     line2="开始",
-                            # )
-                        admin_region_param = {"province": prov_name, "city": cit, "county": county_display}
-                        if county_adcode:
-                            admin_region_param["adcode"] = county_adcode
-                        call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
-                        logger.debug("append county subtask prov=%r city=%r county=%r resource=%r", prov_name, cit, county_display, resource)
-                        subtasks.append({
-                            "call_kw": call_kw,
-                            "call_place": call_place,
-                            "latitude": None,
-                            "longitude": None,
-                            "bbox": None,
-                            "admin_region": admin_region_param,
-                            "resource": resource,
-                            "area_label": f"{prov_name} / {cit} / {county_display}",
-                            "level_label": "county",
-                        })
-                        # 如果提供商在当前区县返回的结果达到 page_limit * page_size 阈值，
-                        # 说明该区可能存在漏采（过于稠密）。在有 polyline 的情况下，尝试使用网格细化采集。
-                        try:
-                            page_size = 20
-                            max_expected = int(page_limit) * page_size
-                            if len(provider_records) >= max_expected:
-                                # 仅在存在 polyline 信息时尝试细化
-                                if isinstance(county_name, dict) and county_name.get("polyline"):
-                                    bbox = bbox_from_polyline(county_name.get("polyline"))
-                                    if bbox:
-                                        grids = generate_grid(bbox, nx=2, ny=2)
-                                        for idx, cell in enumerate(grids):
-                                            if progress_callback:
-                                                try:
-                                                    progress_callback({"type": "start_subtask", "task_name": task_name, "province": prov_name, "city": cit, "county": county_display, "level": "grid", "provider": provider, "grid_index": idx})
-                                                    print(f"1137");
-                                                except Exception:
-                                                    pass
-                                                emit_progress_lines(
-                                                    title=f"{task_name} - {prov_name}/{cit}/{county_display} [grid {idx}] - {resource} - {provider}",
-                                                    line1=f"{prov_name}/{cit}/{county_display} [grid {idx}] - {resource}",
-                                                    line2=f"开始 网格 {idx}",
-                                                )
-                                                call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
-                                                subtasks.append({
-                                                    "call_kw": call_kw,
-                                                    "call_place": call_place,
-                                                    "latitude": None,
-                                                    "longitude": None,
-                                                    "bbox": cell,
-                                                    "admin_region": None,
-                                                    "resource": resource,
-                                                    "area_label": f"{prov_name} / {cit} / {county_display} [grid {idx}]",
-                                                    "level_label": f"grid_{idx}",
-                                                })
-                            
-                        except Exception:
-                            pass
-                    continue
-                    
-                    
-                    
-
-                # 具体的行政区（省/市/县） -> 单次查询调用（使用 execute_subtask）
-                call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
-                if progress_callback:
-                    try:
-                        progress_callback({"type": "start_subtask", "task_name": task_name, "area": normalize_area(area), "level": "single", "provider": provider})
-                        print(f"1166");
-                    except Exception:
-                        pass
-                # emit_progress_lines(
-                #     title=f"{task_name} - {area} - {resource} - {provider}",
-                #     line1=f"{area} - {resource}",
-                #     line2="开始",
-                # )
-                logger.debug("append single subtask area=%r resource=%r admin=%r", area, resource, admin)
-                subtasks.append({
-                    "call_kw": call_kw,
-                    "call_place": call_place,
-                    "latitude": None,
-                    "longitude": None,
-                    "bbox": None,
-                    "admin_region": admin,
-                    "resource": resource,
-                    "area_label": area,
-                    "level_label": "single",
-                })
 
                 if task.get("area_type") != "admin":
                     # 基于 bbox 或点的调用
                     if progress_callback:
                         try:
                             progress_callback({"type": "start_subtask", "task_name": task_name, "area": area, "level": "single", "provider": provider})
-                            print(f"1193");
                         except Exception:
                             pass
                     # 对于 bbox/点 查询也加入子任务队列，统一在队列消费时处理
                     call_kw, call_place = compute_provider_query(provider, keyword, pass_resource)
+                    bbox_payload = task.get("bbox") if task.get("area_type") == "bbox" else None
+                    if isinstance(bbox_payload, dict):
+                        bbox_payload = dict(bbox_payload)
+                        if task.get("polygon") and not bbox_payload.get("polygon"):
+                            bbox_payload["polygon"] = task.get("polygon")
                     subtasks.append({
                         "call_kw": call_kw,
                         "call_place": call_place,
                         "latitude": task_target_values(task).get("latitude"),
                         "longitude": task_target_values(task).get("longitude"),
-                        "bbox": task.get("bbox") if task.get("area_type") == "bbox" else None,
+                        "bbox": bbox_payload,
                         "admin_region": None,
                         "resource": resource,
                         "area_label": area,

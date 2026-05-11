@@ -95,8 +95,8 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
     form.addRow("任务名称：", task_name_edit)
     area_type_combo = QtWidgets.QComboBox()
     # 显示为中文/友好文本，内部使用映射保存为 'admin' / 'bbox'
-    area_type_combo.addItems(["行政区", "BBox"])
-    type_display_to_value = {"行政区": "admin", "BBox": "bbox"}
+    area_type_combo.addItems(["行政区", "多边形"])
+    type_display_to_value = {"行政区": "admin", "多边形": "bbox"}
     type_value_to_display = {v: k for k, v in type_display_to_value.items()}
     form.addRow("选择模式：", area_type_combo)
     country_label = QtWidgets.QLabel("中华人民共和国")
@@ -112,14 +112,34 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
     form.addRow("地区选择：", region_tree)
     # (原先地区的全选按钮已移至任务列表区)
 
-    bbox_left = QtWidgets.QLineEdit()
-    bbox_bottom = QtWidgets.QLineEdit()
-    bbox_right = QtWidgets.QLineEdit()
-    bbox_top = QtWidgets.QLineEdit()
-    form.addRow("BBox 左：", bbox_left)
-    form.addRow("BBox 下：", bbox_bottom)
-    form.addRow("BBox 右：", bbox_right)
-    form.addRow("BBox 上：", bbox_top)
+    polygon_editor = QtWidgets.QWidget()
+    polygon_editor_layout = QtWidgets.QGridLayout(polygon_editor)
+    polygon_editor_layout.setContentsMargins(0, 0, 0, 0)
+    polygon_editor_layout.setHorizontalSpacing(8)
+    polygon_editor_layout.setVerticalSpacing(4)
+    polygon_editor_layout.addWidget(QtWidgets.QLabel("点位"), 0, 0)
+    polygon_editor_layout.addWidget(QtWidgets.QLabel("经度"), 0, 1)
+    polygon_editor_layout.addWidget(QtWidgets.QLabel("纬度"), 0, 2)
+
+    def make_coord_spin(minimum: float, maximum: float):
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(12)
+        spin.setSingleStep(0.001)
+        spin.setAccelerated(True)
+        spin.setProperty("coord_filled", False)
+        spin.valueChanged.connect(lambda _value, widget=spin: widget.setProperty("coord_filled", True))
+        return spin
+
+    polygon_point_spins: List[Dict[str, Any]] = []
+    for point_index in range(4):
+        lng_spin = make_coord_spin(-180.0, 180.0)
+        lat_spin = make_coord_spin(-90.0, 90.0)
+        polygon_point_spins.append({"lng": lng_spin, "lat": lat_spin})
+        polygon_editor_layout.addWidget(QtWidgets.QLabel(f"点 {point_index + 1}"), point_index + 1, 0)
+        polygon_editor_layout.addWidget(lng_spin, point_index + 1, 1)
+        polygon_editor_layout.addWidget(lat_spin, point_index + 1, 2)
+    form.addRow("多边形坐标：", polygon_editor)
 
     # 每个任务的提供商、资源与导出选项将在创建控件后添加
 
@@ -129,11 +149,82 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
         cur = area_type_combo.currentText()
         mode_val = type_display_to_value.get(cur, cur)
         is_admin = (mode_val == "admin")
-        # 已移除单选下拉；仅控制 bbox 输入的启用/禁用
-        bbox_left.setEnabled(not is_admin)
-        bbox_bottom.setEnabled(not is_admin)
-        bbox_right.setEnabled(not is_admin)
-        bbox_top.setEnabled(not is_admin)
+        polygon_editor.setEnabled(not is_admin)
+        region_tree.setEnabled( is_admin)
+
+    def parse_polygon_pairs(raw_text: str) -> List[List[float]]:
+        """解析经纬度点串，支持以 `|` 或 `;` 分隔点，点内以 `,` 分隔经纬度。"""
+        if raw_text is None:
+            return []
+        text = str(raw_text).strip()
+        if not text:
+            return []
+        parts = [p.strip() for p in re.split(r"[|;]", text) if p and p.strip()]
+        points: List[List[float]] = []
+        for part in parts:
+            seg = [x.strip() for x in part.split(",")]
+            if len(seg) != 2:
+                raise ValueError("多边形坐标格式错误，应为 lng,lat|lng,lat")
+            lng = float(seg[0])
+            lat = float(seg[1])
+            points.append([lng, lat])
+        if len(points) < 3:
+            raise ValueError("多边形至少需要 3 个坐标点")
+        return points
+
+    def close_polygon(points: List[List[float]]) -> List[List[float]]:
+        if not points:
+            return points
+        first = points[0]
+        last = points[-1]
+        if abs(first[0] - last[0]) > 1e-12 or abs(first[1] - last[1]) > 1e-12:
+            return points + [[first[0], first[1]]]
+        return points
+
+    def format_polygon(points: List[List[float]], sep: str = "|") -> str:
+        return sep.join([f"{p[0]:.12g},{p[1]:.12g}" for p in points])
+
+    def polygon_bbox(points: List[List[float]]) -> Dict[str, float]:
+        lons = [p[0] for p in points]
+        lats = [p[1] for p in points]
+        return {
+            "left": min(lons),
+            "bottom": min(lats),
+            "right": max(lons),
+            "top": max(lats),
+        }
+
+    def set_polygon_spin_values(points: List[List[float]]) -> None:
+        normalized_points = list(points[:4]) if points else []
+        for index, pair in enumerate(polygon_point_spins):
+            lng_spin = pair["lng"]
+            lat_spin = pair["lat"]
+            lng_spin.blockSignals(True)
+            lat_spin.blockSignals(True)
+            try:
+                if index < len(normalized_points):
+                    lng_spin.setValue(float(normalized_points[index][0]))
+                    lat_spin.setValue(float(normalized_points[index][1]))
+                    lng_spin.setProperty("coord_filled", True)
+                    lat_spin.setProperty("coord_filled", True)
+                else:
+                    lng_spin.setValue(0.0)
+                    lat_spin.setValue(0.0)
+                    lng_spin.setProperty("coord_filled", False)
+                    lat_spin.setProperty("coord_filled", False)
+            finally:
+                lng_spin.blockSignals(False)
+                lat_spin.blockSignals(False)
+
+    def polygon_points_from_spins() -> List[List[float]]:
+        points: List[List[float]] = []
+        for pair in polygon_point_spins:
+            lng_spin = pair["lng"]
+            lat_spin = pair["lat"]
+            if not bool(lng_spin.property("coord_filled")) or not bool(lat_spin.property("coord_filled")):
+                raise ValueError("多边形模式下必须填写 4 组经纬度坐标")
+            points.append([float(lng_spin.value()), float(lat_spin.value())])
+        return points
 
     # 使用选项卡：任务编辑 与 全局设置
     tabs = QtWidgets.QTabWidget()
@@ -154,7 +245,8 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
     glob_layout = QtWidgets.QFormLayout(glob_group)
     provider_combo = QtWidgets.QComboBox()
     # 显示中文名称，并映射到内部提供商键
-    provider_display_to_value = {"百度": "baidu", "高德": "gaode", "天地图": "tianditu"}
+    # provider_display_to_value = {"百度": "baidu", "高德": "gaode", "天地图": "tianditu"}
+    provider_display_to_value = {"高德": "gaode", "天地图": "tianditu"}
     provider_value_to_display = {v: k for k, v in provider_display_to_value.items()}
     provider_combo.addItems(list(provider_display_to_value.keys()))
     # 资源选择：默认以逗号分隔关键字存储，但界面中使用资源树进行多选
@@ -892,6 +984,23 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
             update_mode_ui()
         except Exception:
             pass
+        # restore polygon input
+        try:
+            bb = t.get("bbox") if isinstance(t.get("bbox"), dict) else {}
+            poly = t.get("polygon") or bb.get("polygon") or ""
+            if not poly and isinstance(bb, dict) and all(k in bb for k in ("left", "right", "bottom", "top")):
+                # 兼容旧 bbox 配置：自动转换为闭合矩形多边形展示
+                left = float(bb.get("left"))
+                right = float(bb.get("right"))
+                bottom = float(bb.get("bottom"))
+                top = float(bb.get("top"))
+                poly = f"{left},{top}|{right},{top}|{right},{bottom}|{left},{bottom}|{left},{top}"
+            points = parse_polygon_pairs(str(poly)) if poly else []
+            if points and len(points) > 1 and abs(points[0][0] - points[-1][0]) <= 1e-12 and abs(points[0][1] - points[-1][1]) <= 1e-12:
+                points = points[:-1]
+            set_polygon_spin_values(points)
+        except Exception:
+            pass
         # 不在主面板日志输出区显示历史日志（历史日志请使用“日志查询”选项卡查看）
         # record which task index is currently loaded in the editor
         nonlocal selected_task_index
@@ -1146,6 +1255,11 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
                 current_cfg["schedule_interval_days"] = int(sched_spin.value())
             except Exception:
                 current_cfg["schedule_interval_days"] = int(current_cfg.get("schedule_interval_days", 1))
+
+            try:
+                 current_cfg["default_page_limit"] = int(page_spin.value());
+            except Exception:
+                 current_cfg["default_page_limit"] = int(current_cfg.get("default_page_limit", 10));
             current_cfg["max_concurrency"] = 1
             # resources are per-task now; do not save them as global here
             # ensure export format saved globally
@@ -1185,12 +1299,18 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
             atype = type_display_to_value.get(atype_display, atype_display)
             task: Dict[str, Any] = {"name": name, "enabled": True, "area_type": atype}
             if atype == "bbox":
-                task["bbox"] = {"left": float(bbox_left.text() or 0), "bottom": float(bbox_bottom.text() or 0), "right": float(bbox_right.text() or 0), "top": float(bbox_top.text() or 0)}
+                pts = close_polygon(polygon_points_from_spins())
+                poly_text = format_polygon(pts, sep="|")
+                bb = polygon_bbox(pts)
+                bb["polygon"] = poly_text
+                task["bbox"] = bb
+                task["polygon"] = poly_text
             else:
                 # single-selection dropdowns removed; admin will be set from region_tree selection
                 admin = {"country": country_label.text(), "province": "", "city": "", "county": ""}
                 # admin regions will be stored in 'admin_regions' only
                 task["bbox"] = None
+                task.pop("polygon", None)
             # per-task provider
             try:
                 prov_disp = provider_combo.currentText()
@@ -1386,6 +1506,10 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
         nonlocal selected_task_index
         selected_task_index = -1
         task_name_edit.setText(f"新任务_{len(current_cfg.get('tasks', []))+1}")
+        try:
+            set_polygon_spin_values([])
+        except Exception:
+            pass
 
     def delete_task_ui():
         checked = get_checked_task_indices()
@@ -1619,10 +1743,7 @@ def create_gui_pyqt(config_path: str, testing_hooks: Dict[str, Any] = None) -> N
             "region_tree": region_tree,
             "task_list": task_list,
             "resources_tree": resources_tree,
-            "bbox_left": bbox_left,
-            "bbox_bottom": bbox_bottom,
-            "bbox_right": bbox_right,
-            "bbox_top": bbox_top,
+            "polygon_point_spins": polygon_point_spins,
         }
         testing_hooks["actions"] = {
             "save_task": save_task,

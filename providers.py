@@ -3,12 +3,139 @@ import time
 import re
 import json
 from typing import Any, Dict, List, Optional
+from pathlib import Path
+from urllib.parse import unquote
 import rate_limiter
 
 AMAP_TYPE_MAP = {
     "hospital": "120000",
     "gas_station": "050700",
 }
+
+_GAODE_CODE_NAME_MAP: Optional[Dict[str, str]] = None
+
+
+def _load_gaode_code_name_map() -> Dict[str, str]:
+    global _GAODE_CODE_NAME_MAP
+    if _GAODE_CODE_NAME_MAP is not None:
+        return _GAODE_CODE_NAME_MAP
+    mapping: Dict[str, str] = {}
+    try:
+        candidates = [
+            Path(__file__).parent / "config" / "data_type_tree.gaode.json",
+            Path("config") / "data_type_tree.gaode.json",
+        ]
+        tree_path = None
+        for p in candidates:
+            if p.exists():
+                tree_path = p
+                break
+        if tree_path is not None:
+            with open(tree_path, "r", encoding="utf-8") as f:
+                tree = json.load(f)
+
+            def walk(node: Any) -> None:
+                if not isinstance(node, dict):
+                    return
+                for name, val in node.items():
+                    if isinstance(val, dict):
+                        code = val.get("code") or val.get("id")
+                        if code:
+                            mapping[str(code).strip()] = str(name).strip()
+                        children = val.get("children")
+                        if isinstance(children, dict):
+                            walk(children)
+
+            walk(tree)
+    except Exception:
+        mapping = {}
+    _GAODE_CODE_NAME_MAP = mapping
+    return _GAODE_CODE_NAME_MAP
+
+
+def _resolve_gaode_keywords(keyword: str, place_type: Optional[str]) -> str:
+    kw = str(keyword or "").strip()
+    pt = str(place_type or "").strip() if place_type is not None else ""
+
+    # 非纯数字优先按原样作为关键词。
+    if kw and not re.fullmatch(r"\d+", kw):
+        return kw
+    if pt and not re.fullmatch(r"\d+", pt):
+        return pt
+
+    # 数字编码反查中文名称，满足“keywords 必填且可用中文 POI 类型”。
+    code = kw if re.fullmatch(r"\d+", kw or "") else pt
+    if code:
+        code_map = _load_gaode_code_name_map()
+        name = code_map.get(code)
+        if name:
+            return name
+        return code
+    return kw or pt
+
+
+def _build_full_url(url: str, params: Optional[Dict[str, Any]]) -> str:
+    try:
+        req = requests.Request("GET", url, params=params)
+        prepared = req.prepare()
+        return str(prepared.url)
+    except Exception:
+        return str(url)
+
+
+def _print_api_request(provider: str, url: str, params: Optional[Dict[str, Any]]) -> None:
+    try:
+        full_url = _build_full_url(url, params)
+        print(f"[API REQUEST][{provider}] {full_url}")
+        print(f"[API REQUEST DECODED][{provider}] {unquote(full_url)}")
+    except Exception:
+        pass
+
+
+def _print_api_response(provider: str, resp: requests.Response) -> None:
+    try:
+        print(f"[API RESPONSE][{provider}] status={resp.status_code}")
+        print(f"[API RESPONSE BODY][{provider}] {resp.text}")
+    except Exception:
+        pass
+
+
+def _parse_polygon_text(raw: Any) -> List[List[float]]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    chunks = [c.strip() for c in re.split(r"[|;]", text) if c and c.strip()]
+    points: List[List[float]] = []
+    for chunk in chunks:
+        pair = [x.strip() for x in chunk.split(",")]
+        if len(pair) != 2:
+            raise ValueError("polygon 坐标格式错误，应为 lng,lat|lng,lat")
+        points.append([float(pair[0]), float(pair[1])])
+    return points
+
+
+def _close_polygon_points(points: List[List[float]]) -> List[List[float]]:
+    if not points:
+        return points
+    first = points[0]
+    last = points[-1]
+    if abs(first[0] - last[0]) > 1e-12 or abs(first[1] - last[1]) > 1e-12:
+        return points + [[first[0], first[1]]]
+    return points
+
+
+def _polygon_to_pipe(points: List[List[float]]) -> str:
+    return "|".join([f"{p[0]:.12g},{p[1]:.12g}" for p in points])
+
+
+def _polygon_to_comma(points: List[List[float]]) -> str:
+    out: List[str] = []
+    for p in points:
+        out.append(f"{p[0]:.12g}")
+        out.append(f"{p[1]:.12g}")
+    return ",".join(out)
 
 
 def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[float], longitude: Optional[float], bbox: Optional[Dict[str, float]], admin_region: Optional[Dict[str, str]], page_limit: int = 5, progress_callback=None, stop_event=None, debug: bool = False) -> List[Dict[str, Any]]:
@@ -21,6 +148,7 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
     Requirements from plan:
     - Prefer `specify` (行政区 9 位国标码) when available in `admin_region`.
     - If `bbox` is provided, include `mapBound` instead of `specify`.
+    - If polygon coordinates are provided in `bbox['polygon']`, use polygon query.
     - `data_type` may be a comma-separated category string or list.
     """
     
@@ -28,7 +156,10 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
         raise ValueError("天地图 API Key 未配置。")
     result: List[Dict[str, Any]] = []
     page_size = 20
-    for page in range(0, int(page_limit)):
+    # 天地图文档约束：start 取值 0-300。
+    max_pages = (300 // page_size) + 1
+    safe_page_limit = max(1, min(int(page_limit or 1), max_pages))
+    for page in range(0, safe_page_limit):
         # cooperative cancellation
         try:
             if stop_event and getattr(stop_event, 'is_set', lambda: False)():
@@ -43,6 +174,8 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
 
         # build postStr payload according to official example
         start = page * page_size
+        if start > 300:
+            break
         payload: Dict[str, Any] = {"queryType": 13, "start": start, "count": page_size}
 
         # dataTypes: accept list or comma-separated string.
@@ -78,6 +211,16 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
                 return {}
 
         mapping = load_tianditu_mapping()
+        code_to_name: Dict[str, str] = {}
+        try:
+            for name, code in mapping.items():
+                c = str(code).strip()
+                n = str(name).strip()
+                if c and n and c not in code_to_name:
+                    code_to_name[c] = n
+        except Exception:
+            code_to_name = {}
+
         def map_entry(e: str) -> Optional[str]:
             if not e:
                 return None
@@ -117,8 +260,48 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
             if isinstance(dt, str) and dt:
                 payload["dataTypes"] = dt
 
-        # spatial filter: prefer bbox (mapBound) or admin_region.specify (adcode)
-        if bbox is not None:
+        # spatial filter: prefer polygon, then bbox(mapBound), then admin_region.specify
+        polygon_text = None
+        try:
+            if isinstance(bbox, dict):
+                polygon_text = bbox.get("polygon")
+        except Exception:
+            polygon_text = None
+
+        if polygon_text:
+            pts = _parse_polygon_text(polygon_text)
+            pts = _close_polygon_points(pts)
+            if len(pts) < 4:
+                raise ValueError("polygon 至少需要 3 个点并闭合")
+            payload["queryType"] = 10
+            payload["polygon"] = _polygon_to_comma(pts)
+            payload["start"] = max(0, min(start, 300))
+            payload["count"] = max(1, min(page_size, 300))
+            # show 为可选：为获取省市区/typeCode/typeName，默认请求详细 POI 信息。
+            payload.setdefault("show", 2)
+            # 天地图 queryType=10 实测要求必须带 keyWord。
+            kw_text = str(keyword or "").strip()
+            if kw_text and not re.fullmatch(r"\d+", kw_text):
+                payload["keyWord"] = kw_text
+            else:
+                code_candidate = ""
+                if kw_text and re.fullmatch(r"\d+", kw_text):
+                    code_candidate = kw_text
+                elif codes:
+                    code_candidate = str(codes[0]).strip()
+                elif isinstance(dt, str) and dt and re.fullmatch(r"\d+", dt):
+                    code_candidate = dt
+
+                mapped_kw = code_to_name.get(code_candidate, "") if code_candidate else ""
+                if mapped_kw:
+                    payload["keyWord"] = mapped_kw
+                elif code_candidate:
+                    # 无法反查中文时回退为编码，至少满足 keyWord 必填。
+                    payload["keyWord"] = code_candidate
+
+            if not str(payload.get("keyWord") or "").strip():
+                raise ValueError("天地图 polygon 查询需提供 keyWord。")
+        elif bbox is not None:
             # mapBound expected as "minx,miny,maxx,maxy"
             payload["mapBound"] = f"{bbox['left']},{bbox['bottom']},{bbox['right']},{bbox['top']}"
         else:
@@ -132,40 +315,22 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
                     if name:
                         payload["specify"] = str(name)
         # require either mapBound or specify per plan
-        if "mapBound" not in payload and "specify" not in payload:
-            raise ValueError("天地图查询需提供 'specify'(区/县 国标码) 或 bbox(mapBound)。")
+        if "mapBound" not in payload and "specify" not in payload and "polygon" not in payload:
+            raise ValueError("天地图查询需提供 polygon、specify(区/县国标码) 或 bbox(mapBound)。")
 
         params = {"postStr": json.dumps(payload, ensure_ascii=False), "type": "query", "tk": key}
         try:
             rate_limiter.acquire("tianditu")
         except Exception:
             pass
-        # Debug: 打印将要发送的请求参数
-        if debug:
-            try:
-                print(f"[DEBUG] Tianditu REQUEST url=http://api.tianditu.gov.cn/v2/search params={params}")
-            except Exception:
-                pass
+        _print_api_request("tianditu", "http://api.tianditu.gov.cn/v2/search", params)
         resp = requests.get("http://api.tianditu.gov.cn/v2/search", params=params, timeout=20)
-        # Debug: 打印响应状态
-        if debug:
-            try:
-                print(f"[DEBUG] Tianditu RESPONSE status={resp.status_code}")
-                # 尝试打印部分响应文本以便调试（防止过长）
-                txt = resp.text
-                print(f"[DEBUG] Tianditu RESPONSE text={txt[:2000]}" if txt else "[DEBUG] Tianditu RESPONSE empty body")
-            except Exception:
-                pass
+        _print_api_response("tianditu", resp)
         resp.raise_for_status()
         try:
             data = resp.json()
         except Exception:
-            # Debug: 无法解析 JSON 时打印原始文本
-            if debug:
-                try:
-                    print(f"[DEBUG] Tianditu invalid JSON body: {getattr(resp, 'text', '')[:2000]}")
-                except Exception:
-                    pass
+            # JSON 解析失败时响应正文已由统一日志函数输出
             break
 
         # normalize possible result containers
@@ -189,6 +354,15 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
         for item in items:
             if not isinstance(item, dict):
                 continue
+            def first_text(*keys: str) -> str:
+                for k in keys:
+                    v = item.get(k)
+                    if v is None:
+                        continue
+                    s = str(v).strip()
+                    if s:
+                        return s
+                return ""
             # try common keys
             name = item.get("name") or item.get("title") or item.get("poi_name") or ""
             addr = item.get("address") or item.get("addr") or ""
@@ -218,6 +392,9 @@ def fetch_tianditu(key: str, keyword: str, data_type: str, latitude: Optional[fl
                 "contact": contact,
                 "latitude": lat,
                 "longitude": lng,
+                "province": first_text("province", "provinceName", "prov", "provName", "pname"),
+                "city": first_text("city", "cityName", "cityname", "cname", "province", "provinceName", "pname"),
+                "county": first_text("county", "countyName", "district", "districtName", "adname"),
                 "source": "tianditu",
             })
         if not normalized:
@@ -290,7 +467,9 @@ def fetch_baidu(key: str, keyword: str, place_type: str, latitude: Optional[floa
             rate_limiter.acquire("baidu")
         except Exception:
             pass
+        _print_api_request("baidu", "http://api.map.baidu.com/place/v2/search", params)
         resp = requests.get("http://api.map.baidu.com/place/v2/search", params=params, timeout=20)
+        _print_api_response("baidu", resp)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != 0:
@@ -346,6 +525,7 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
         types = AMAP_TYPE_MAP.get(place_type)
     # cap page_limit to a safe maximum (AMap doc suggests up to 40)
     page_limit = min(int(page_limit or 0) or 1, 40)
+    keyword_text = _resolve_gaode_keywords(str(keyword or "").strip(), types)
     # prefer admin_region adcode if provided for precise county-level query
     for page in range(1, page_limit + 1):
         # cooperative cancellation: if stop requested, break early
@@ -361,17 +541,33 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
         except Exception:
             pass
         if bbox is not None:
-            url = "https://restapi.amap.com/v3/place/polygon"
-            polygon = (
-                f"{bbox['left']},{bbox['top']};"
-                f"{bbox['right']},{bbox['top']};"
-                f"{bbox['right']},{bbox['bottom']};"
-                f"{bbox['left']},{bbox['bottom']}"
-            )
+            polygon_text = None
+            try:
+                if isinstance(bbox, dict):
+                    polygon_text = bbox.get("polygon")
+            except Exception:
+                polygon_text = None
+
+            if polygon_text:
+                pts = _parse_polygon_text(polygon_text)
+                pts = _close_polygon_points(pts)
+                if len(pts) < 4:
+                    raise ValueError("多边形至少需要 3 个点并闭合")
+                url = "https://restapi.amap.com/v5/place/polygon"
+                polygon = _polygon_to_pipe(pts)
+            else:
+                url = "https://restapi.amap.com/v3/place/polygon"
+                polygon = (
+                    f"{bbox['left']},{bbox['top']}|"
+                    f"{bbox['right']},{bbox['top']}|"
+                    f"{bbox['right']},{bbox['bottom']}|"
+                    f"{bbox['left']},{bbox['bottom']}|"
+                    f"{bbox['left']},{bbox['top']}"
+                )
             params = {
                 "key": key,
                 "polygon": polygon,
-                "keywords": keyword,
+                "keywords": keyword_text,
                 "offset": 20,
                 "page": page,
                 "extensions": "base",
@@ -386,7 +582,7 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
                 url = "https://restapi.amap.com/v3/place/text"
                 params = {
                     "key": key,
-                    "types": keyword,
+                    "keywords": keyword_text,
                     "city": city,
                     # 限定到指定城市/区县，避免跨城模糊匹配（AMap 支持 true/false）
                     "citylimit": "true",
@@ -399,7 +595,7 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
                 params = {
                     "key": key,
                     "location": f"{longitude},{latitude}",
-                    "keywords": keyword,
+                    "keywords": keyword_text,
                     "radius": None,
                     "offset": 20,
                     "page": page,
@@ -418,7 +614,9 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
                     rate_limiter.acquire("gaode")
                 except Exception:
                     pass
+                _print_api_request("gaode", url, params)
                 resp = requests.get(url, params=params, timeout=20)
+                _print_api_response("gaode", resp)
                 resp.raise_for_status()
                 data = resp.json()
                 # check AMap status
@@ -461,6 +659,9 @@ def fetch_gaode(key: str, keyword: str, place_type: str, latitude: Optional[floa
                 "contact": item.get("tel", ""),
                 "latitude": float(lat) if lat else None,
                 "longitude": float(lng) if lng else None,
+                "province": item.get("pname", "") or "",
+                "city": item.get("cityname", "") or "",
+                "county": item.get("adname", "") or "",
                 "source": "gaode",
             })
         if len(pois) < 20:
@@ -508,7 +709,9 @@ def fetch_tencent(key: str, keyword: str, place_type: str, latitude: Optional[fl
             rate_limiter.acquire("tencent")
         except Exception:
             pass
+        _print_api_request("tencent", "https://apis.map.qq.com/ws/place/v1/search", params)
         resp = requests.get("https://apis.map.qq.com/ws/place/v1/search", params=params, timeout=20)
+        _print_api_response("tencent", resp)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") != 0:

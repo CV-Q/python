@@ -341,6 +341,40 @@ def normalize_record(
     if source == "baidu" and latitude is not None and longitude is not None:
         longitude, latitude = bd09_to_gcj02(float(longitude), float(latitude))
     admin_region = admin_region or {}
+
+    def _first_nonempty(*vals: Any) -> str:
+        for v in vals:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return ""
+
+    province_val = _first_nonempty(
+        admin_region.get("province", ""),
+        element.get("province", ""),
+        element.get("provinceName", ""),
+        element.get("pname", ""),
+        element.get("prov", ""),
+        element.get("provName", ""),
+    )
+    city_val = _first_nonempty(
+        admin_region.get("city", ""),
+        element.get("city", ""),
+        element.get("cityName", ""),
+        element.get("cityname", ""),
+        element.get("cname", ""),
+    )
+    county_val = _first_nonempty(
+        admin_region.get("county", ""),
+        element.get("county", ""),
+        element.get("countyName", ""),
+        element.get("district", ""),
+        element.get("districtName", ""),
+        element.get("adname", ""),
+    )
+
     return {
         "source": source,
         "id": element.get("id") or element.get("uid") or element.get("sid") or "",
@@ -351,9 +385,9 @@ def normalize_record(
         "type": place_type,
         "contact": element.get("contact", "") or element.get("telephone", "") or element.get("tel", ""),
         "task": task_name,
-        "province": admin_region.get("province", "") or "",
-        "city": admin_region.get("city", "") or "",
-        "county": admin_region.get("county", "") or "",
+        "province": province_val,
+        "city": city_val,
+        "county": county_val,
         "run_time": run_time,
     }
 

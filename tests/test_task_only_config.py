@@ -29,6 +29,7 @@ def main() -> None:
         captured["provider"] = provider
         captured["keyword"] = keyword
         captured["place_type"] = place_type
+        captured["bbox"] = bbox
         captured["admin_region"] = admin_region
         return []
 
@@ -68,6 +69,30 @@ def main() -> None:
     assert result["status"] == "success", result
     assert captured.get("provider") == "tianditu", captured
     assert captured.get("place_type") == "170101", captured
+
+    captured.clear()
+    polygon_task = {
+        "name": "task_polygon_runtime",
+        "enabled": True,
+        "area_type": "bbox",
+        "provider": "gaode",
+        "resources": ["050301"],
+        "polygon": "116.460988,40.006919|116.48231,40.007381|116.47516,39.99713|116.472596,39.985227|116.460988,40.006919",
+        "bbox": {
+            "left": 116.460988,
+            "bottom": 39.985227,
+            "right": 116.48231,
+            "top": 40.007381,
+            "polygon": "116.460988,40.006919|116.48231,40.007381|116.47516,39.99713|116.472596,39.985227|116.460988,40.006919",
+        },
+    }
+
+    polygon_result = mp.run_task(polygon_task, task_only_config, mode="manual")
+    assert polygon_result["status"] == "success", polygon_result
+    assert captured.get("provider") == "gaode", captured
+    assert captured.get("admin_region") is None, captured
+    assert captured.get("place_type") == "050301", captured
+    assert captured.get("bbox", {}).get("polygon") == polygon_task["polygon"], captured
 
     temp_path.unlink(missing_ok=True)
     print("task-only config regression passed")
